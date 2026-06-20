@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import httpx
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 load_dotenv()
 
