@@ -712,7 +712,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d == "support":
         await q.edit_message_text("💬 پیام مستقیم بفرستید:", reply_markup=InlineKeyboardMarkup([
-            [btn_action("💬 ارسال پیام", "https://t.me/admin")],
+            [btn_action("💬 ارسال پیام", "https://t.me/inthenameofcyrus")],
             [btn_back("main_menu")],
         ]))
 
