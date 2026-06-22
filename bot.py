@@ -261,8 +261,14 @@ async def call_ai(image_b64: str, prompt: str = "") -> str:
     async with httpx.AsyncClient(timeout=90.0) as client:
         r = await client.post(API_URL, headers=headers, json=payload)
         if r.status_code != 200:
-            raise Exception("API error " + str(r.status_code))
-        return r.json()["choices"][0]["message"]["content"]
+            body = r.text[:200] if r.text else ""
+            if "Unavailable" in body or r.status_code == 503:
+                raise Exception("API temporarily unavailable. Credits may be exhausted.")
+            raise Exception("API error " + str(r.status_code) + ": " + body[:100])
+        result = r.json()
+        if "choices" not in result or not result["choices"]:
+            raise Exception("No response from API")
+        return result["choices"][0]["message"]["content"]
 
 # ═══════════════════════ GATE ═══════════════════════
 
@@ -960,8 +966,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
     except Exception as e:
+        err = str(e)
+        if "unavailable" in err.lower() or "credits" in err.lower():
+            user_msg = "❌ سرویس AI موقتاً در دسترس نیست.\nلطفاً بعداً دوباره تلاش کنید."
+        elif "rate" in err.lower() or "429" in err:
+            user_msg = "⏳ تعداد درخواست‌ها زیاد شده.\nچند دقیقه صبر کنید."
+        else:
+            user_msg = "❌ خطا در تحلیل:\n`" + err[:200] + "`"
         await msg.edit_text(
-            "❌ خطا در تحلیل:\n`" + str(e)[:200] + "`",
+            user_msg,
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
                 [btn_action("💬 پشتیبانی", "support")]
             ])
