@@ -15,6 +15,7 @@ API_URL = os.getenv("API_URL", "https://api.unli.dev/v1/chat/completions")
 MODEL_NAME = os.getenv("MODEL_NAME", "auto")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "TXYZxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+BOT_NAME = "انالیزور مورتال"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -22,26 +23,11 @@ log = logging.getLogger(__name__)
 DB_PATH = Path("data.db")
 
 PLANS = {
-    "day": {
-        "name": "۱ روزه", "price": 5, "days": 1, "max": -1, "cooldown": 30,
-        "desc": "تستی — هر ۳۰ دقیقه یک تحلیل", "emoji": "⚡"
-    },
-    "month_basic": {
-        "name": "۱ ماهه پایه", "price": 30, "days": 30, "max": 500, "cooldown": 15,
-        "desc": "۵۰۰ تحلیل — هر ۱۵ دقیقه", "emoji": "📦"
-    },
-    "month_unlimited": {
-        "name": "۱ ماهه نامحدود", "price": 60, "days": 30, "max": -1, "cooldown": 0,
-        "desc": "نامحدود — بدون محدودیت", "emoji": "👑"
-    },
-    "year_basic": {
-        "name": "۱ ساله پایه", "price": 250, "days": 365, "max": 5000, "cooldown": 25,
-        "desc": "۵۰۰۰ تحلیل — هر ۲۵ دقیقه", "emoji": "📅"
-    },
-    "year_unlimited": {
-        "name": "۱ ساله نامحدود", "price": 350, "days": 365, "max": -1, "cooldown": 0,
-        "desc": "نامحدود — بدون محدودیت", "emoji": "💎"
-    },
+    "day": {"name": "۱ روزه", "price": 5, "days": 1, "max": -1, "cooldown": 30, "desc": "تستی — هر ۳۰ دقیقه"},
+    "month_basic": {"name": "۱ ماهه پایه", "price": 30, "days": 30, "max": 500, "cooldown": 15, "desc": "۵۰۰ تحلیل — هر ۱۵ دقیقه"},
+    "month_unlimited": {"name": "۱ ماهه نامحدود", "price": 60, "days": 30, "max": -1, "cooldown": 0, "desc": "نامحدود"},
+    "year_basic": {"name": "۱ ساله پایه", "price": 250, "days": 365, "max": 5000, "cooldown": 25, "desc": "۵۰۰۰ تحلیل — هر ۲۵ دقیقه"},
+    "year_unlimited": {"name": "۱ ساله نامحدود", "price": 350, "days": 365, "max": -1, "cooldown": 0, "desc": "نامحدود"},
 }
 
 # ═══════════════════════ BUTTONS ═══════════════════════
@@ -57,9 +43,6 @@ def btn_back(data="main_menu"):
 
 def btn_action(text, data):
     return InlineKeyboardButton(f"▸ {text}", callback_data=data)
-
-def btn_link(text, url):
-    return InlineKeyboardButton(text, url=url)
 
 # ═══════════════════════ DATABASE ═══════════════════════
 
@@ -77,7 +60,8 @@ def init_db():
             usage_count INTEGER DEFAULT 0,
             max_usage INTEGER DEFAULT 0,
             cooldown_minutes INTEGER DEFAULT 0,
-            last_analysis_at TEXT DEFAULT ''
+            last_analysis_at TEXT DEFAULT '',
+            discount_percent INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS pending_payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +73,6 @@ def init_db():
             status TEXT DEFAULT 'pending'
         );
     """)
-    # Clean up old incomplete records
     conn.execute("DELETE FROM pending_payments WHERE tx_hash IN ('awaiting_payment', '') AND status='pending'")
     conn.commit(); conn.close()
 
@@ -99,16 +82,6 @@ def get_sub(user_id: int):
     r = conn.execute("SELECT * FROM subscriptions WHERE user_id = ?", (user_id,)).fetchone()
     conn.close()
     return dict(r) if r else None
-
-def is_active(user_id: int) -> bool:
-    sub = get_sub(user_id)
-    if not sub or sub["status"] != "active": return False
-    if sub["expires_at"] and datetime.fromisoformat(sub["expires_at"]) < datetime.now():
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.execute("UPDATE subscriptions SET status='expired' WHERE user_id=?", (user_id,))
-        conn.commit(); conn.close()
-        return False
-    return True
 
 def can_analyze(user_id: int) -> tuple:
     sub = get_sub(user_id)
@@ -122,8 +95,7 @@ def can_analyze(user_id: int) -> tuple:
         last = datetime.fromisoformat(sub["last_analysis_at"])
         diff = (datetime.now() - last).total_seconds() / 60
         if diff < sub["cooldown_minutes"]:
-            remaining = int(sub["cooldown_minutes"] - diff)
-            return False, "صبر کن " + str(remaining) + " دقیقه"
+            return False, "صبر کن " + str(int(sub["cooldown_minutes"] - diff)) + " دقیقه"
     return True, "ok"
 
 def record_analysis(user_id: int):
@@ -147,36 +119,6 @@ def activate_sub(user_id: int, username: str, plan: str):
     """, (user_id, username, plan, datetime.now().isoformat(), expires, p["max"], p["cooldown"]))
     conn.commit(); conn.close()
 
-def get_all_user_ids():
-    conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute("SELECT user_id FROM subscriptions WHERE status='active'").fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-def get_all_subscriber_ids():
-    conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute("SELECT user_id FROM subscriptions").fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-def get_stats():
-    conn = sqlite3.connect(str(DB_PATH))
-    total = conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
-    active = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE status='active'").fetchone()[0]
-    expired = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE status='expired'").fetchone()[0]
-    pending = conn.execute("SELECT COUNT(*) FROM pending_payments WHERE status='pending'").fetchone()[0]
-    total_analyses = conn.execute("SELECT SUM(usage_count) FROM subscriptions").fetchone()[0] or 0
-    revenue = conn.execute("""
-        SELECT SUM(p.price) FROM pending_payments pp
-        JOIN subscriptions s ON pp.user_id = s.user_id
-        WHERE pp.status='approved'
-    """).fetchone()[0] or 0
-    conn.close()
-    return {
-        "total": total, "active": active, "expired": expired,
-        "pending": pending, "total_analyses": total_analyses, "revenue": revenue
-    }
-
 def revoke_sub(user_id: int):
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("UPDATE subscriptions SET status='revoked' WHERE user_id=?", (user_id,))
@@ -187,53 +129,88 @@ def extend_sub(user_id: int, days: int):
     sub = conn.execute("SELECT expires_at FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
     if sub and sub[0]:
         exp = datetime.fromisoformat(sub[0])
-        if exp < datetime.now():
-            exp = datetime.now()
+        if exp < datetime.now(): exp = datetime.now()
         new_exp = (exp + timedelta(days=days)).isoformat()
     else:
         new_exp = (datetime.now() + timedelta(days=days)).isoformat()
     conn.execute("UPDATE subscriptions SET expires_at=?, status='active' WHERE user_id=?", (new_exp, user_id))
     conn.commit(); conn.close()
 
+def set_discount(user_id: int, percent: int):
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("UPDATE subscriptions SET discount_percent=? WHERE user_id=?", (percent, user_id))
+    conn.commit(); conn.close()
+
+def get_all_user_ids():
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute("SELECT user_id FROM subscriptions WHERE status='active'").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def get_stats():
+    conn = sqlite3.connect(str(DB_PATH))
+    total = conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
+    active = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE status='active'").fetchone()[0]
+    expired = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE status='expired'").fetchone()[0]
+    revoked = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE status='revoked'").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM pending_payments WHERE status='pending'").fetchone()[0]
+    total_analyses = conn.execute("SELECT SUM(usage_count) FROM subscriptions").fetchone()[0] or 0
+    conn.close()
+    return {"total": total, "active": active, "expired": expired, "revoked": revoked,
+            "pending": pending, "total_analyses": total_analyses}
+
 # ═══════════════════════ SYSTEM PROMPT ═══════════════════════
 
 SYSTEM_PROMPT = (
-    "تو 'شهباز کور' هستی — تحلیلگر حرفه‌ای شرط‌بندی Mortal Kombat.\n"
-    "فقط فارسی خروجی بده.\n\n"
+    "تو 'تحلیلگر ارشد Mortal Kombat' هستی — یک متخصص ۲۰ ساله MK.\n"
+    "فقط فارسی خروجی بده. هیچوقت انگلیسی ننویس.\n\n"
+
+    "دانش تو از MK:\n"
+    "- تمام کاراکترها و move set های آنها (بازی‌های MK11, MK1, MK1 Mobile)\n"
+    "- frame data: startup, recovery, plus-on-block, minus-on-block\n"
+    "- combo damage: کومبوهای بهینه و optimal punish\n"
+    "- matchup knowledge: چه کاراکتری در برابر چه کاراکتری برتری داره\n"
+    "- tournament meta: ترندهای فعلی بازی و tier list\n"
+    "- betting markets: انواع شرط‌بندی (moneyline, props, round duration, total rounds)\n\n"
 
     "قوانین تحلیل:\n"
-    "1. تحلیل عمیق کاراکترها: سبک بازی، برتری رنج (close/mid/far)، ضعف‌ها.\n"
-    "2. ضرایب شرط‌بندی رو از عکس استخراج کن.\n"
-    "3. فقط پیشنهاد مارتینگل با ضریب >= ۱.۸ بده.\n"
-    "4. احتمال واقع‌بینانه (حداکثر ۶۵٪).\n"
-    "5. اگر هیچ ضریب مناسبی نیست: وضعیت: خطرناک. وارد نشو.\n"
-    "6. هیچوقت ۱۰۰٪ اطمینان نده — همیشه ریسک هست.\n"
-    "7. درصد برد رو واقع‌بینانه حساب کن — MK همیشه unpredictable هست.\n\n"
+    "1. ابتدا عکس رو دقیق بررسی کن — کاراکترها، ضرایب، نوع شرط\n"
+    "2. تحلیل matchup: چه کسی در چه رنجی (close/mid/far) برتره\n"
+    "3. frame advantage: کی turn داره، کی باید صبر کنه\n"
+    "4. combo potential: هر کاراکتر چقدر damage میزنه\n"
+    "5. اولویت با props (زیر/بالای ثانیه) بیشتر از moneyline\n"
+    "6. فقط پیشنهاد با ضریب >= ۱.۸ بده\n"
+    "7. احتمال واقع‌بینانه — حداکثر ۶۵٪ (MK همیشه unpredictable هست)\n"
+    "8. اگر هیچ گزینه مناسبی نیست: 'وضعیت: خطرناک. وارد نشو.'\n"
+    "9. هیچوقت ۱۰۰٪ اطمینان نده\n\n"
 
     "فرمت خروجی:\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "⚔ [کاراکتر۱] vs [کاراکتر۲]\n\n"
 
     "📊 تحلیل:\n"
-    "▸ [کاراکتر۱]: [۱-۲ خط: سبک بازی، نقطه قوت، نقطه ضعف]\n"
-    "▸ [کاراکتر۲]: [۱-۲ خط: سبک بازی، نقطه قوت، نقطه ضعف]\n"
-    "▸ مقایسه: [۱ خط: چه کسی در چه رنجی برتره]\n\n"
+    "▸ [کاراکتر۱]: [سبک بازی + نقطه قوت + نقطه ضعف — ۲ خط]\n"
+    "▸ [کاراکتر۲]: [سبک بازی + نقطه قوت + نقطه ضعف — ۲ خط]\n"
+    "▸ مقایسه: [چه کسی در چه رنجی برتره + frame advantage — ۱ خط]\n"
+    "▸ کومبو: [هر کاراکتر چقدر damage میزنه — ۱ خط]\n\n"
 
     "🎯 پیشنهاد مارتینگل:\n"
     "▸ [شرط دقیق] — ضریب [X.XX]\n"
     "▸ احتمال برد: [XX–XX٪]\n"
-    "▸ توضیح: [۱-۲ خط دلیل منطقی]\n\n"
+    "▸ دلیل: [۲-۳ خط منطقی با اشاره به frame data یا matchup]\n\n"
 
     "⚠️ هشدارها:\n"
-    "▸ [هر نکته مهم درباره ریسک یا شرایط خاص]\n"
+    "▸ [نکات ریسک و شرایط خاص]\n"
 
     "━━━━━━━━━━━━━━━━━━\n\n"
 
-    "نکات مهم:\n"
-    "- راند اول معمولاً محافظه‌کارانه‌ست → زیر/بالای زمان گزینه خوبیه\n"
-    "- اگر ضریب برنده خیلی پایینه (< ۱.۵) → شرط برنده ارزش نداره\n"
-    "- Focus روی props (زیر/بالای ثانیه، تعداد ضربه) بیشتر از moneyline\n"
-    "- اگر دو کاراکتر نزدیک هم هستن → شرط زمان بهتر از شرط برنده‌ست\n"
+    "نکات استراتژیک:\n"
+    "- راند اول معمولاً محافظه‌کارانه → props زمان بهترین گزینه\n"
+    "- اگر ضریب برنده < ۱.۵ → ارزش ریسک نداره\n"
+    "- اگر دو کاراکتر tier نزدیک → props بهتر از moneyline\n"
+    "- rushdown vs zoner → معمولاً round 1 کشیده میشه\n"
+    "- mirror match → همیشه unpredictable → وارد نشو\n"
+    "- اگر یک کاراکتر明显ly بهتره → ضریبش پایینه و ارزش نداره\n"
 )
 
 MAX_IMAGE_SIZE = 8 * 1024 * 1024
@@ -265,25 +242,25 @@ def split_msg(text: str, ml: int = 3800) -> list:
 # ═══════════════════════ AI CALL ═══════════════════════
 
 async def call_ai(image_b64: str, prompt: str = "") -> str:
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    content = [{"type": "text", "text": prompt or "اسکرین‌شات مسابقه Mortal Kombat را تحلیل کن."}]
+    headers = {"Authorization": "Bearer " + API_KEY, "Content-Type": "application/json"}
+    content = [{"type": "text", "text": prompt or "اسکرین‌شات مسابقه Mortal Kombat رو تحلیل کن. کاراکترها، ضرایب و نوع شرط رو شناسایی کن و تحلیل کامل بده."}]
     if image_b64:
         content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_b64}})
     payload = {
         "model": MODEL_NAME,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}],
-        "temperature": 0.15, "max_tokens": 1500
+        "temperature": 0.15, "max_tokens": 2000
     }
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(API_URL, headers=headers, json=payload)
         if r.status_code != 200:
             body = r.text[:200] if r.text else ""
             if "Unavailable" in body or r.status_code == 503:
-                raise Exception("API temporarily unavailable. Credits may be exhausted.")
-            raise Exception("API error " + str(r.status_code) + ": " + body[:100])
+                raise Exception("سرویس AI موقتاً در دسترس نیست.")
+            raise Exception("خطای API: " + str(r.status_code))
         result = r.json()
         if "choices" not in result or not result["choices"]:
-            raise Exception("No response from API")
+            raise Exception("پاسخی از API دریافت نشد")
         return result["choices"][0]["message"]["content"]
 
 # ═══════════════════════ GATE ═══════════════════════
@@ -294,6 +271,8 @@ def is_admin(uid):
 def gate(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
+        if is_admin(uid):
+            return await func(update, context)
         ok, reason = can_analyze(uid)
         if not ok:
             kb = InlineKeyboardMarkup([
@@ -302,7 +281,7 @@ def gate(func):
             ])
             await update.message.reply_text(
                 "╔══════════════════════╗\n"
-                "  🔐 **شهباز کور**\n"
+                "  🔐 **" + BOT_NAME + "**\n"
                 "  " + reason + "\n"
                 "╚══════════════════════╝\n\n"
                 "برای خرید اشتراک دکمه زیر را بزنید:",
@@ -319,7 +298,7 @@ def main_menu_kb(uid):
     if sub and sub["status"] == "active":
         return InlineKeyboardMarkup([
             [btn_main("📸 تحلیل مسابقه", "send_photo_hint")],
-            [btn_main("📊 آمار و اطلاعات من", "my_stats")],
+            [btn_main("📊 آمار من", "my_stats")],
             [btn_main("📦 تمدید اشتراک", "show_plans")],
             [btn_action("💬 پشتیبانی", "support")],
         ])
@@ -328,13 +307,27 @@ def main_menu_kb(uid):
         [btn_action("💬 پشتیبانی", "support")],
     ])
 
-def admin_menu_kb():
+def admin_kb():
     return InlineKeyboardMarkup([
-        [btn_main("📊 آمار کلی", "admin_stats")],
-        [btn_main("💰 رسیدهای در انتظار", "admin_pending")],
-        [btn_main("👥 لیست کاربران", "admin_users")],
-        [btn_main("🔍 جستجوی کاربر", "admin_search")],
-        [btn_action("📢 ارسال همگانی", "admin_broadcast")],
+        [btn_main("📊 آمار کلی", "ad_stats")],
+        [btn_main("💰 رسیدهای در انتظار", "ad_pending")],
+        [btn_main("👥 لیست کاربران", "ad_users")],
+        [btn_main("🔍 جستجوی کاربر", "ad_search")],
+        [btn_main("🎁 تخفیف", "ad_discount")],
+        [btn_action("📢 ارسال همگانی", "ad_broadcast")],
+        [btn_action("⚙️ تنظیمات", "ad_settings")],
+    ])
+
+def admin_user_kb(target_uid):
+    return InlineKeyboardMarkup([
+        [btn("📦 فعال‌سازی اشتراک", "ad_act_" + str(target_uid))],
+        [btn("⏰ تمدید ۷ روز", "ad_ext7_" + str(target_uid))],
+        [btn("⏰ تمدید ۳۰ روز", "ad_ext30_" + str(target_uid))],
+        [btn("🚫 لغو اشتراک", "ad_revoke_" + str(target_uid))],
+        [btn("🎁 تخفیف ۲۰٪", "ad_disc20_" + str(target_uid))],
+        [btn("🎁 تخفیف ۵۰٪", "ad_disc50_" + str(target_uid))],
+        [btn("🎁 حذف تخفیف", "ad_disc0_" + str(target_uid))],
+        [btn_back("ad_users")],
     ])
 
 # ═══════════════════════ START ═══════════════════════
@@ -344,66 +337,58 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "کاربر"
     sub = get_sub(uid)
 
+    if is_admin(uid):
+        stats = get_stats()
+        return await update.message.reply_text(
+            "╔══════════════════════╗\n"
+            "  🛡 **پنل مدیریت " + BOT_NAME + "**\n"
+            "╚══════════════════════╝\n\n"
+            "┌─────────────────────┐\n"
+            "│ 👥 کل کاربران: **" + str(stats['total']) + "**\n"
+            "│ ✅ فعال: **" + str(stats['active']) + "**\n"
+            "│ ❌ منقضی: **" + str(stats['expired']) + "**\n"
+            "│ 🚫 لغو شده: **" + str(stats['revoked']) + "**\n"
+            "│ ⏳ در انتظار: **" + str(stats['pending']) + "**\n"
+            "│ 📊 کل تحلیل‌ها: **" + str(stats['total_analyses']) + "**\n"
+            "└─────────────────────┘",
+            parse_mode="Markdown", reply_markup=admin_kb()
+        )
+
     if sub and sub["status"] == "active":
         p = PLANS.get(sub["plan"], {})
         expires = sub["expires_at"][:10] if sub["expires_at"] else "—"
         usage = sub["usage_count"]
         max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
-        cd = sub["cooldown_minutes"]
-        cd_text = "هر " + str(cd) + " دقیقه" if cd > 0 else "بدون محدودیت"
         remaining = "∞"
         if sub["expires_at"]:
             exp = datetime.fromisoformat(sub["expires_at"])
-            diff = exp - datetime.now()
-            remaining = str(diff.days) + " روز"
+            remaining = str((exp - datetime.now()).days) + " روز"
+        discount = sub.get("discount_percent", 0)
+        disc_text = "\n│ 🏷 تخفیف: **" + str(discount) + "٪**" if discount > 0 else ""
         await update.message.reply_text(
             "╔══════════════════════╗\n"
-            "  ⚔ **شهباز کور** ⚔\n"
+            "  ⚔ **" + BOT_NAME + "** ⚔\n"
             "╚══════════════════════╝\n\n"
             "سلام **" + name + "** 👋\n\n"
             "┌─────────────────────┐\n"
             "│ 📦 پلن: " + p.get('name', sub['plan']) + "\n"
             "│ 📊 تحلیل‌ها: **" + str(usage) + "/" + str(max_u) + "**\n"
-            "│ ⏰ کول‌داون: " + cd_text + "\n"
-            "│ 📅 باقی‌مانده: " + remaining + "\n"
+            "│ 📅 باقی‌مانده: " + remaining + disc_text + "\n"
             "└─────────────────────┘\n\n"
-            "برای تحلیل، عکس اسکرین‌شات بفرستید\n"
-            "یا از دکمه‌های زیر استفاده کنید:",
+            "📸 عکس اسکرین‌شات بفرستید:",
             parse_mode="Markdown", reply_markup=main_menu_kb(uid)
         )
     else:
         await update.message.reply_text(
             "╔══════════════════════╗\n"
-            "  ⚔ **شهباز کور** ⚔\n"
+            "  ⚔ **" + BOT_NAME + "** ⚔\n"
             "╚══════════════════════╝\n\n"
-            "🎮 **سیستم تحلیل شرط‌بندی MK**\n"
+            "🎮 **تحلیلگر هوشمند شرط‌بندی MK**\n"
             "مخصوص سیستم مارتینگل\n\n"
             "🔐 **نیاز به اشتراک**\n\n"
             "برای شروع دکمه زیر را بزنید:",
             parse_mode="Markdown", reply_markup=main_menu_kb(uid)
         )
-
-# ═══════════════════════ ADMIN START ═══════════════════════
-
-async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("⛔ دسترسی غیرمجاز.")
-    stats = get_stats()
-    await update.message.reply_text(
-        "╔══════════════════════╗\n"
-        "  🛡 **پنل مدیریت** 🛡\n"
-        "╚══════════════════════╝\n\n"
-        "┌─────────────────────┐\n"
-        "│ 👥 کل کاربران: **" + str(stats['total']) + "**\n"
-        "│ ✅ فعال: **" + str(stats['active']) + "**\n"
-        "│ ❌ منقضی: **" + str(stats['expired']) + "**\n"
-        "│ ⏳ در انتظار: **" + str(stats['pending']) + "**\n"
-        "│ 📊 کل تحلیل‌ها: **" + str(stats['total_analyses']) + "**\n"
-        "│ 💰 درآمد: **$" + str(stats['revenue']) + "**\n"
-        "└─────────────────────┘\n\n"
-        "عملیات مورد نظر را انتخاب کنید:",
-        parse_mode="Markdown", reply_markup=admin_menu_kb()
-    )
 
 # ═══════════════════════ CALLBACKS ═══════════════════════
 
@@ -412,7 +397,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     d = q.data
     uid = q.from_user.id
-    name = q.from_user.first_name or "کاربر"
 
     # ─── MAIN MENU ───
     if d == "main_menu":
@@ -422,71 +406,74 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expires = sub["expires_at"][:10] if sub["expires_at"] else "—"
             usage = sub["usage_count"]
             max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
-            cd = sub["cooldown_minutes"]
-            cd_text = "هر " + str(cd) + " دقیقه" if cd > 0 else "بدون محدودیت"
             remaining = "∞"
             if sub["expires_at"]:
                 exp = datetime.fromisoformat(sub["expires_at"])
-                diff = exp - datetime.now()
-                remaining = str(diff.days) + " روز"
+                remaining = str((exp - datetime.now()).days) + " روز"
+            discount = sub.get("discount_percent", 0)
+            disc_text = "\n│ 🏷 تخفیف: **" + str(discount) + "٪**" if discount > 0 else ""
             await q.edit_message_text(
                 "╔══════════════════════╗\n"
-                "  ⚔ **شهباز کور** ⚔\n"
+                "  ⚔ **" + BOT_NAME + "** ⚔\n"
                 "╚══════════════════════╝\n\n"
-                "سلام **" + name + "** 👋\n\n"
+                "سلام **" + q.from_user.first_name + "** 👋\n\n"
                 "┌─────────────────────┐\n"
                 "│ 📦 پلن: " + p.get('name', sub['plan']) + "\n"
                 "│ 📊 تحلیل‌ها: **" + str(usage) + "/" + str(max_u) + "**\n"
-                "│ ⏰ کول‌داون: " + cd_text + "\n"
-                "│ 📅 باقی‌مانده: " + remaining + "\n"
+                "│ 📅 باقی‌مانده: " + remaining + disc_text + "\n"
                 "└─────────────────────┘\n\n"
-                "برای تحلیل، عکس اسکرین‌شات بفرستید\n"
-                "یا از دکمه‌های زیر استفاده کنید:",
+                "📸 عکس اسکرین‌شات بفرستید:",
                 parse_mode="Markdown", reply_markup=main_menu_kb(uid)
             )
         else:
             await q.edit_message_text(
                 "╔══════════════════════╗\n"
-                "  ⚔ **شهباز کور** ⚔\n"
+                "  ⚔ **" + BOT_NAME + "** ⚔\n"
                 "╚══════════════════════╝\n\n"
-                "🎮 **سیستم تحلیل شرط‌بندی MK**\n"
+                "🎮 **تحلیلگر هوشمند شرط‌بندی MK**\n"
                 "مخصوص سیستم مارتینگل\n\n"
-                "🔐 **نیاز به اشتراک**\n\n"
-                "برای شروع دکمه زیر را بزنید:",
+                "🔐 **نیاز به اشتراک**",
                 parse_mode="Markdown", reply_markup=main_menu_kb(uid)
             )
 
     # ─── PLANS ───
     elif d == "show_plans":
+        sub = get_sub(uid)
+        discount = sub.get("discount_percent", 0) if sub else 0
+        def disc_price(price):
+            if discount > 0:
+                return str(int(price * (100 - discount) / 100))
+            return str(price)
         kb = InlineKeyboardMarkup([
-            [btn("⚡ ۱ روزه — $5", "plan_day")],
-            [btn("📦 ۱ ماهه پایه — $30", "plan_month_basic")],
-            [btn("👑 ۱ ماهه نامحدود — $60", "plan_month_unlimited")],
-            [btn("📅 ۱ ساله پایه — $250", "plan_year_basic")],
-            [btn("💎 ۱ ساله نامحدود — $350", "plan_year_unlimited")],
+            [btn("⚡ ۱ روزه — $" + disc_price(5), "plan_day")],
+            [btn("📦 ۱ ماهه پایه — $" + disc_price(30), "plan_month_basic")],
+            [btn("👑 ۱ ماهه نامحدود — $" + disc_price(60), "plan_month_unlimited")],
+            [btn("📅 ۱ ساله پایه — $" + disc_price(250), "plan_year_basic")],
+            [btn("💎 ۱ ساله نامحدود — $" + disc_price(350), "plan_year_unlimited")],
             [btn_back("main_menu")],
         ])
+        disc_text = "\n🏷 **تخفیف " + str(discount) + "٪ فعال** — قیمت‌ها اعمال شده!" if discount > 0 else ""
         await q.edit_message_text(
             "╔══════════════════════╗\n"
             "     📦 **پلن‌های اشتراک**\n"
             "╚══════════════════════╝\n\n"
             "┌─────────────────────────┐\n"
-            "│ ⚡ **۱ روزه — $5**\n"
+            "│ ⚡ **۱ روزه — $" + disc_price(5) + "**\n"
             "│ هر ۳۰ دقیقه یک تحلیل\n"
             "├─────────────────────────┤\n"
-            "│ 📦 **۱ ماهه پایه — $30**\n"
+            "│ 📦 **۱ ماهه پایه — $" + disc_price(30) + "**\n"
             "│ ۵۰۰ تحلیل — هر ۱۵ دقیقه\n"
             "├─────────────────────────┤\n"
-            "│ 👑 **۱ ماهه نامحدود — $60**\n"
+            "│ 👑 **۱ ماهه نامحدود — $" + disc_price(60) + "**\n"
             "│ بدون محدودیت\n"
             "├─────────────────────────┤\n"
-            "│ 📅 **۱ ساله پایه — $250**\n"
+            "│ 📅 **۱ ساله پایه — $" + disc_price(250) + "**\n"
             "│ ۵۰۰۰ تحلیل — هر ۲۵ دقیقه\n"
             "├─────────────────────────┤\n"
-            "│ 💎 **۱ ساله نامحدود — $350**\n"
+            "│ 💎 **۱ ساله نامحدود — $" + disc_price(350) + "**\n"
             "│ بدون محدودیت\n"
             "└─────────────────────────┘\n\n"
-            "💰 پرداخت: **USDT (TRC20)**\n\n"
+            "💰 پرداخت: **USDT (TRC20)**" + disc_text + "\n\n"
             "پلن مورد نظر را انتخاب کنید:",
             parse_mode="Markdown", reply_markup=kb
         )
@@ -497,18 +484,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if plan not in PLANS:
             return await q.edit_message_text("پلن نامعتبر.")
         p = PLANS[plan]
-
-        # Store selected plan in pending_payments immediately
         conn = sqlite3.connect(str(DB_PATH))
-        username = q.from_user.username or ""
         existing = conn.execute("SELECT id FROM pending_payments WHERE user_id=? AND status='pending'", (uid,)).fetchone()
         if existing:
             conn.execute("UPDATE pending_payments SET plan=? WHERE id=?", (plan, existing[0]))
         else:
             conn.execute("INSERT INTO pending_payments (user_id, username, plan, tx_hash) VALUES (?, ?, ?, ?)",
-                         (uid, username, plan, "awaiting_payment"))
+                         (uid, q.from_user.username or "", plan, "awaiting_payment"))
         conn.commit(); conn.close()
-
         kb = InlineKeyboardMarkup([
             [btn_action("📋 کپی آدرس", "copy_addr")],
             [btn_action("📝 ارسال رسید", "how_receipt")],
@@ -525,260 +508,296 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "└─────────────────────┘\n\n"
             "🔹 **آدرس USDT (TRC20):**\n"
             "`" + PAYMENT_ADDRESS + "`\n\n"
-            "⚠️ فقط **USDT TRC20** بفرستید.\n\n"
-            "بعد از پرداخت، TX Hash را\n"
-            "اینجا بفرستید تا رسید ثبت شود.",
+            "⚠️ فقط **USDT TRC20** بفرستید.\n"
+            "بعد از پرداخت، TX Hash رو اینجا بفرستید.",
             parse_mode="Markdown", reply_markup=kb
         )
 
-    # ─── HOW TO SEND RECEIPT ───
     elif d == "how_receipt":
         await q.edit_message_text(
             "╔══════════════════════╗\n"
             "  📝 **ارسال رسید پرداخت**\n"
             "╚══════════════════════╝\n\n"
-            "مرحله ۱: پرداخت را انجام دهید\n"
-            "مرحله ۲: TX Hash را کپی کنید\n"
-            "مرحله ۳: آن را اینجا بفرستید\n\n"
-            "فرمت ارسال:\n"
-            "`TX_HASH_HERE`\n\n"
-            "⚠️ TX Hash معمولاً ۶۴ کاراکتر است\n"
-            "و با حروف و اعداد شروع می‌شود.",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("main_menu")]
-            ])
+            "۱. پرداخت رو انجام بدید\n"
+            "۲. TX Hash رو کپی کنید\n"
+            "۳. اینجا بفرستید\n\n"
+            "فرمت: `TX_HASH_HERE`\n"
+            "(معمولاً ۶۴ کاراکتر)",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("main_menu")]])
         )
 
-    # ─── PHOTO HINT ───
     elif d == "send_photo_hint":
         await q.edit_message_text(
             "╔══════════════════════╗\n"
             "  📸 **تحلیل مسابقه**\n"
             "╚══════════════════════╝\n\n"
-            "برای تحلیل کافیست:\n\n"
-            "۱. اسکرین‌شات مسابقه را بفرستید\n"
-            "۲. منتظر تحلیل شوید\n\n"
-            "⚡ تحلیل خودکار و فوری\n"
-            "🎯 مخصوص سیستم مارتینگل\n\n"
-            "عکس را همینجا ارسال کنید 👇",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("main_menu")]
-            ])
+            "اسکرین‌شات مسابقه رو بفرستید.\n"
+            "تحلیل خودکار و فوری انجام میشه.\n\n"
+            "🎯 مخصوص سیستم مارتینگل",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("main_menu")]])
         )
 
-    # ─── MY STATS ───
     elif d == "my_stats":
         sub = get_sub(uid)
         if not sub or sub["status"] != "active":
             return await q.edit_message_text(
-                "اشتراک فعال ندارید.\n\n"
-                "برای خرید اشتراک دکمه زیر را بزنید:",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                    [btn_main("📦 مشاهده پلن‌ها", "show_plans")]
-                ])
+                "اشتراک فعال ندارید.",
+                reply_markup=InlineKeyboardMarkup([[btn_main("📦 مشاهده پلن‌ها", "show_plans")]])
             )
         p = PLANS.get(sub["plan"], {})
         max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
         remaining = "∞"
         if sub["expires_at"]:
             exp = datetime.fromisoformat(sub["expires_at"])
-            diff = exp - datetime.now()
-            remaining = str(diff.days) + " روز"
-        cd = sub["cooldown_minutes"]
-        cd_text = "هر " + str(cd) + " دقیقه" if cd > 0 else "بدون محدودیت"
+            remaining = str((exp - datetime.now()).days) + " روز"
+        discount = sub.get("discount_percent", 0)
+        disc_text = " | 🏷 " + str(discount) + "٪ تخفیف" if discount > 0 else ""
         await q.edit_message_text(
             "╔══════════════════════╗\n"
             "  📊 **آمار شما**\n"
             "╚══════════════════════╝\n\n"
             "┌─────────────────────┐\n"
-            "│ 👤 **" + name + "**\n"
+            "│ 👤 **" + q.from_user.first_name + "**\n"
             "│ 📦 پلن: " + p.get('name', sub['plan']) + "\n"
             "│ 📊 تحلیل‌ها: **" + str(sub['usage_count']) + "/" + str(max_u) + "**\n"
-            "│ ⏰ کول‌داون: " + cd_text + "\n"
-            "│ 📅 باقی‌مانده: " + remaining + "\n"
+            "│ 📅 باقی‌مانده: " + remaining + disc_text + "\n"
             "│ 💎 وضعیت: ✅ فعال\n"
             "└─────────────────────┘",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
                 [btn_action("📸 تحلیل مسابقه", "send_photo_hint")],
-                [btn_main("📦 تمدید اشتراک", "show_plans")],
+                [btn_main("📦 تمدید", "show_plans")],
                 [btn_back("main_menu")],
             ])
         )
 
-    # ─── SUPPORT ───
     elif d == "support":
         await q.edit_message_text(
             "╔══════════════════════╗\n"
             "  💬 **پشتیبانی**\n"
             "╚══════════════════════╝\n\n"
-            "برای ارتباط با ادمین:\n"
-            "پیام مستقیم بفرستید.\n"
-            "یا از طریق دکمه زیر:",
+            "پیام مستقیم بفرستید:",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_link("💬 ارسال پیام به ادمین", "https://t.me/admin")],
+                [btn_action("💬 ارسال پیام", "https://t.me/admin")],
                 [btn_back("main_menu")],
             ])
         )
 
-    # ─── COPY ADDRESS ───
     elif d == "copy_addr":
         await q.answer("📋 آدرس کپی شد:\n" + PAYMENT_ADDRESS, show_alert=True)
 
-    # ─── ADMIN: APPROVE ───
-    elif d.startswith("approve_"):
+    # ─── ADMIN: APPROVE/REJECT ───
+    elif d.startswith("approve_") or d.startswith("reject_"):
         if not is_admin(uid):
             return await q.answer("⛔ غیرمجاز", show_alert=True)
         try:
             target = int(d.split("_")[1])
         except:
-            return await q.answer("❌ خطا در پردازش", show_alert=True)
-        plan = "month_basic"
+            return await q.answer("❌ خطا", show_alert=True)
+        approve = d.startswith("approve_")
         conn = sqlite3.connect(str(DB_PATH))
-        row = conn.execute("SELECT plan FROM pending_payments WHERE user_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1", (target,)).fetchone()
-        if row and row[0] in PLANS:
-            plan = row[0]
-        conn.execute("UPDATE pending_payments SET status='approved' WHERE user_id=? AND status='pending'", (target,))
-        conn.commit(); conn.close()
-        activate_sub(target, "", plan)
-        p = PLANS[plan]
-        try:
-            cd_text = "بدون محدودیت" if p['cooldown'] == 0 else "هر " + str(p['cooldown']) + " دقیقه"
-            max_text = "∞" if p['max'] <= 0 else str(p['max'])
-            await context.bot.send_message(target,
-                "╔══════════════════════╗\n"
-                "  ✅ **اشتراک فعال شد!**\n"
-                "╚══════════════════════╝\n\n"
-                "┌─────────────────────┐\n"
-                "│ 📦 پلن: " + p['name'] + "\n"
-                "│ 📊 محدودیت: " + max_text + " تحلیل\n"
-                "│ ⏰ کول‌داون: " + cd_text + "\n"
-                "│ 📅 مدت: " + str(p['days']) + " روز\n"
-                "└─────────────────────┘\n\n"
-                "📸 عکس بفرست برای تحلیل!",
-                parse_mode="Markdown", reply_markup=main_menu_kb(target)
-            )
-            log.info("Subscription activated for user %d, plan: %s", target, plan)
-        except Exception as e:
-            log.error("Failed to notify user %d: %s", target, str(e))
-        await q.edit_message_text("✅ تایید شد — اشتراک " + plan + " برای " + str(target) + " فعال شد.")
-
-    # ─── ADMIN: REJECT ───
-    elif d.startswith("reject_"):
-        if not is_admin(uid):
-            return await q.answer("⛔ غیرمجاز", show_alert=True)
-        try:
-            target = int(d.split("_")[1])
-        except:
-            return await q.answer("❌ خطا در پردازش", show_alert=True)
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.execute("UPDATE pending_payments SET status='rejected' WHERE user_id=? AND status='pending'", (target,))
-        conn.commit(); conn.close()
-        try:
-            await context.bot.send_message(target,
-                "╔══════════════════════╗\n"
-                "  ❌ **رسید تایید نشد**\n"
-                "╚══════════════════════╝\n\n"
-                "رسید شما بررسی شد و تایید نشد.\n"
-                "لطفاً با ادمین تماس بگیرید.",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                    [btn_action("💬 پشتیبانی", "support")]
-                ])
-            )
-        except Exception as e:
-            log.error("Failed to notify rejection to user %d: %s", target, str(e))
-        await q.edit_message_text("❌ رد شد.")
+        if approve:
+            row = conn.execute("SELECT plan FROM pending_payments WHERE user_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1", (target,)).fetchone()
+            plan = row[0] if row and row[0] in PLANS else "month_basic"
+            conn.execute("UPDATE pending_payments SET status='approved' WHERE user_id=? AND status='pending'", (target,))
+            conn.commit(); conn.close()
+            activate_sub(target, "", plan)
+            p = PLANS[plan]
+            try:
+                cd = "بدون محدودیت" if p['cooldown'] == 0 else "هر " + str(p['cooldown']) + " دقیقه"
+                mx = "∞" if p['max'] <= 0 else str(p['max'])
+                await context.bot.send_message(target,
+                    "╔══════════════════════╗\n"
+                    "  ✅ **اشتراک فعال شد!**\n"
+                    "╚══════════════════════╝\n\n"
+                    "📦 پلن: " + p['name'] + "\n"
+                    "📊 محدودیت: " + mx + " تحلیل\n"
+                    "⏰ کول‌داون: " + cd + "\n"
+                    "📅 مدت: " + str(p['days']) + " روز\n\n"
+                    "📸 عکس بفرست برای تحلیل!",
+                    parse_mode="Markdown", reply_markup=main_menu_kb(target)
+                )
+            except: pass
+            await q.edit_message_text("✅ تایید شد — اشتراک " + plan + " برای " + str(target))
+        else:
+            conn.execute("UPDATE pending_payments SET status='rejected' WHERE user_id=? AND status='pending'", (target,))
+            conn.commit(); conn.close()
+            try:
+                await context.bot.send_message(target,
+                    "❌ **رسید شما تایید نشد.**\nبا ادمین تماس بگیرید.",
+                    parse_mode="Markdown"
+                )
+            except: pass
+            await q.edit_message_text("❌ رد شد.")
 
     # ─── ADMIN: STATS ───
-    elif d == "admin_stats":
-        if not is_admin(uid):
-            return await q.answer("⛔ غیرمجاز", show_alert=True)
+    elif d == "ad_stats":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
         stats = get_stats()
         await q.edit_message_text(
             "╔══════════════════════╗\n"
             "  📊 **آمار کلی سیستم**\n"
             "╚══════════════════════╝\n\n"
-            "┌─────────────────────┐\n"
-            "│ 👥 کل کاربران: **" + str(stats['total']) + "**\n"
-            "│ ✅ فعال: **" + str(stats['active']) + "**\n"
-            "│ ❌ منقضی: **" + str(stats['expired']) + "**\n"
-            "│ ⏳ در انتظار تایید: **" + str(stats['pending']) + "**\n"
-            "│ 📊 کل تحلیل‌ها: **" + str(stats['total_analyses']) + "**\n"
-            "│ 💰 درآمد تایید شده: **$" + str(stats['revenue']) + "**\n"
-            "└─────────────────────┘",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("admin_panel")]
-            ])
+            "👥 کل کاربران: **" + str(stats['total']) + "**\n"
+            "✅ فعال: **" + str(stats['active']) + "**\n"
+            "❌ منقضی: **" + str(stats['expired']) + "**\n"
+            "🚫 لغو شده: **" + str(stats['revoked']) + "**\n"
+            "⏳ در انتظار: **" + str(stats['pending']) + "**\n"
+            "📊 کل تحلیل‌ها: **" + str(stats['total_analyses']) + "**",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]])
         )
 
     # ─── ADMIN: PENDING ───
-    elif d == "admin_pending":
-        if not is_admin(uid):
-            return await q.answer("⛔ غیرمجاز", show_alert=True)
+    elif d == "ad_pending":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
         conn = sqlite3.connect(str(DB_PATH))
-        rows = conn.execute("SELECT id, user_id, username, plan, tx_hash, created_at FROM pending_payments WHERE status='pending' ORDER BY created_at DESC").fetchall()
+        rows = conn.execute("SELECT user_id, username, plan, tx_hash, created_at FROM pending_payments WHERE status='pending' ORDER BY created_at DESC").fetchall()
         conn.close()
         if not rows:
-            return await q.edit_message_text(
-                "📭 رسید در انتظار نیست.",
-                reply_markup=InlineKeyboardMarkup([[btn_back("admin_panel")]])
-            )
+            return await q.edit_message_text("📭 رسید در انتظار نیست.", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]]))
         msg = "💰 **رسیدهای در انتظار**\n\n"
         for r in rows:
-            plan_name = PLANS.get(r[3], {}).get('name', r[3])
-            msg += "🆔 `" + str(r[1]) + "` — @" + (r[2] or "—") + "\n"
-            msg += "📦 " + plan_name + " — `" + r[4][:15] + "...`\n"
-            msg += "🕐 " + r[5][:16] + "\n\n"
-        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-            [btn_back("admin_panel")]
-        ]))
+            pn = PLANS.get(r[2], {}).get('name', r[2])
+            msg += "🆔 `" + str(r[0]) + "` — @" + (r[1] or "—") + "\n📦 " + pn + " — `" + r[3][:15] + "...`\n🕐 " + r[4][:16] + "\n\n"
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]]))
 
     # ─── ADMIN: USERS ───
-    elif d == "admin_users":
-        if not is_admin(uid):
-            return await q.answer("⛔ غیرمجاز", show_alert=True)
+    elif d == "ad_users":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
         conn = sqlite3.connect(str(DB_PATH))
-        rows = conn.execute("SELECT user_id, username, plan, status, usage_count, expires_at FROM subscriptions ORDER BY status='active' DESC, expires_at DESC").fetchall()
+        rows = conn.execute("SELECT user_id, username, plan, status, usage_count, expires_at, discount_percent FROM subscriptions ORDER BY status='active' DESC, expires_at DESC").fetchall()
         conn.close()
         if not rows:
-            return await q.edit_message_text(
-                "📭 کاربری نیست.",
-                reply_markup=InlineKeyboardMarkup([[btn_back("admin_panel")]])
-            )
+            return await q.edit_message_text("📭 کاربری نیست.", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]]))
         msg = "👥 **لیست کاربران**\n\n"
         for r in rows:
-            status_emoji = "✅" if r[3] == "active" else "❌"
-            plan_name = PLANS.get(r[2], {}).get('name', r[2])
-            expires = r[5][:10] if r[5] else "—"
-            msg += status_emoji + " `" + str(r[0]) + "` — @" + (r[1] or "—") + "\n"
-            msg += "  📦 " + plan_name + " | 📊 " + str(r[4]) + " | 📅 " + expires + "\n\n"
-        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-            [btn_back("admin_panel")]
-        ]))
+            se = "✅" if r[3] == "active" else ("🚫" if r[3] == "revoked" else "❌")
+            pn = PLANS.get(r[2], {}).get('name', r[2])
+            exp = r[5][:10] if r[5] else "—"
+            disc = " 🏷" + str(r[6]) + "٪" if r[6] > 0 else ""
+            msg += se + " `" + str(r[0]) + "` — @" + (r[1] or "—") + disc + "\n  📦 " + pn + " | 📊 " + str(r[4]) + " | 📅 " + exp + "\n\n"
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]]))
 
     # ─── ADMIN: SEARCH ───
-    elif d == "admin_search":
-        if not is_admin(uid):
-            return await q.answer("⛔ غیرمجاز", show_alert=True)
+    elif d == "ad_search":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
         await q.edit_message_text(
-            "🔍 **جستجوی کاربر**\n\n"
-            "آیدی عددی کاربر را بفرستید:\n"
-            "`/search USER_ID`",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("admin_panel")]
-            ])
+            "🔍 **جستجوی کاربر**\n\nآیدی عددی کاربر رو بفرستید:\n`/srch USER_ID`",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]])
+        )
+
+    # ─── ADMIN: DISCOUNT ───
+    elif d == "ad_discount":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
+        await q.edit_message_text(
+            "🎁 **تنظیم تخفیف**\n\n"
+            "آیدی کاربر و درصد تخفیف رو بفرستید:\n"
+            "`/disc USER_ID PERCENT`\n\n"
+            "مثال: `/disc 123456 20` → تخفیف ۲۰٪",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]])
         )
 
     # ─── ADMIN: BROADCAST ───
-    elif d == "admin_broadcast":
-        if not is_admin(uid):
-            return await q.answer("⛔ غیرمجاز", show_alert=True)
+    elif d == "ad_broadcast":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
         await q.edit_message_text(
-            "📢 **ارسال همگانی**\n\n"
-            "متن پیام را بفرستید:\n"
-            "`/broadcast متن پیام`",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("admin_panel")]
-            ])
+            "📢 **ارسال همگانی**\n\nمتن پیام رو بفرستید:\n`/bc متن پیام`",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]])
+        )
+
+    # ─── ADMIN: SETTINGS ───
+    elif d == "ad_settings":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
+        await q.edit_message_text(
+            "⚙️ **تنظیمات سیستم**\n\n"
+            "🤖 نام ربات: " + BOT_NAME + "\n"
+            "🔗 API: " + API_URL + "\n"
+            "🧠 مدل: " + MODEL_NAME + "\n"
+            "💰 آدرس پرداخت: `" + PAYMENT_ADDRESS + "`\n"
+            "👤 ادمین: `" + str(ADMIN_ID) + "`",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("admin_menu")]])
+        )
+
+    # ─── ADMIN: USER ACTION SUB-MENUS ───
+    elif d.startswith("ad_act_") or d.startswith("ad_ext7_") or d.startswith("ad_ext30_") or d.startswith("ad_revoke_") or d.startswith("ad_disc"):
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
+        try:
+            target = int(d.split("_")[-1])
+        except:
+            return await q.answer("❌ خطا", show_alert=True)
+
+        if d.startswith("ad_act_"):
+            await q.edit_message_text(
+                "📦 **انتخاب پلن برای " + str(target) + "**\n\nپلن رو انتخاب کنید:",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
+                    [btn("⚡ ۱ روزه", "ad_activate_" + str(target) + "_day")],
+                    [btn("📦 ماهانه پایه", "ad_activate_" + str(target) + "_month_basic")],
+                    [btn("👑 ماهانه نامحدود", "ad_activate_" + str(target) + "_month_unlimited")],
+                    [btn("📅 سالانه پایه", "ad_activate_" + str(target) + "_year_basic")],
+                    [btn("💎 سالانه نامحدود", "ad_activate_" + str(target) + "_year_unlimited")],
+                    [btn_back("ad_users")],
+                ])
+            )
+        elif d.startswith("ad_activate_"):
+            parts = d.replace("ad_activate_", "").split("_")
+            target = int(parts[0])
+            plan = "_".join(parts[1:])
+            if plan not in PLANS:
+                return await q.answer("پلن نامعتبر", show_alert=True)
+            activate_sub(target, "", plan)
+            p = PLANS[plan]
+            try:
+                await context.bot.send_message(target,
+                    "✅ **اشتراک فعال شد!**\n\nپلن: " + p['name'] + "\n\n📸 عکس بفرست!",
+                    parse_mode="Markdown", reply_markup=main_menu_kb(target)
+                )
+            except: pass
+            await q.edit_message_text("✅ اشتراک " + plan + " برای " + str(target) + " فعال شد.")
+
+        elif d.startswith("ad_ext7_"):
+            extend_sub(target, 7)
+            try:
+                await context.bot.send_message(target, "⏰ **اشتراک ۷ روز تمدید شد.**", parse_mode="Markdown")
+            except: pass
+            await q.edit_message_text("✅ " + str(target) + " → ۷ روز تمدید.")
+
+        elif d.startswith("ad_ext30_"):
+            extend_sub(target, 30)
+            try:
+                await context.bot.send_message(target, "⏰ **اشتراک ۳۰ روز تمدید شد.**", parse_mode="Markdown")
+            except: pass
+            await q.edit_message_text("✅ " + str(target) + " → ۳۰ روز تمدید.")
+
+        elif d.startswith("ad_revoke_"):
+            revoke_sub(target)
+            try:
+                await context.bot.send_message(target, "🚫 **اشتراک شما لغو شد.**", parse_mode="Markdown")
+            except: pass
+            await q.edit_message_text("🚫 اشتراک " + str(target) + " لغو شد.")
+
+        elif d.startswith("ad_disc20_"):
+            set_discount(target, 20)
+            await q.edit_message_text("🎁 تخفیف ۲۰٪ برای " + str(target) + " فعال شد.")
+
+        elif d.startswith("ad_disc50_"):
+            set_discount(target, 50)
+            await q.edit_message_text("🎁 تخفیف ۵۰٪ برای " + str(target) + " فعال شد.")
+
+        elif d.startswith("ad_disc0_"):
+            set_discount(target, 0)
+            await q.edit_message_text("🚫 تخفیف " + str(target) + " حذف شد.")
+
+    # ─── ADMIN: BACK TO ADMIN MENU ───
+    elif d == "admin_menu":
+        if not is_admin(uid): return await q.answer("⛔", show_alert=True)
+        stats = get_stats()
+        await q.edit_message_text(
+            "╔══════════════════════╗\n"
+            "  🛡 **پنل مدیریت " + BOT_NAME + "**\n"
+            "╚══════════════════════╝\n\n"
+            "👥 کل: **" + str(stats['total']) + "** | ✅ فعال: **" + str(stats['active']) + "**\n"
+            "❌ منقضی: **" + str(stats['expired']) + "** | 🚫 لغو: **" + str(stats['revoked']) + "**\n"
+            "⏳ در انتظار: **" + str(stats['pending']) + "** | 📊 تحلیل: **" + str(stats['total_analyses']) + "**",
+            parse_mode="Markdown", reply_markup=admin_kb()
         )
 
 # ═══════════════════════ TEXT HANDLER ═══════════════════════
@@ -787,81 +806,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # ─── ADMIN: SEARCH ───
-    if is_admin(uid) and text.startswith("/search ") and len(context.args) == 1:
+    # ─── ADMIN: SEARCH USER ───
+    if is_admin(uid) and text.startswith("/srch ") and len(context.args) == 1:
         try:
             target = int(context.args[0])
         except:
             return await update.message.reply_text("آیدی نامعتبر.")
         sub = get_sub(target)
         if not sub:
-            return await update.message.reply_text("کاربر یافت نشد.")
+            return await update.message.reply_text(
+                "❌ کاربر یافت نشد.\n\nآیا میخواهید اشتراک فعال کنید؟",
+                reply_markup=InlineKeyboardMarkup([
+                    [btn("📦 فعال‌سازی", "ad_act_" + str(target))],
+                    [btn_back("admin_menu")]
+                ])
+            )
         p = PLANS.get(sub["plan"], {})
-        status_emoji = "✅" if sub["status"] == "active" else "❌"
-        max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
+        se = "✅" if sub["status"] == "active" else "❌"
+        mx = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
+        disc = sub.get("discount_percent", 0)
+        disc_text = "\n🏷 تخفیف: **" + str(disc) + "٪**" if disc > 0 else ""
         await update.message.reply_text(
             "🔍 **اطلاعات کاربر**\n\n"
-            "┌─────────────────────┐\n"
-            "│ 🆔 آیدی: `" + str(target) + "`\n"
-            "│ 👤 یوزرنیم: @" + (sub["username"] or "—") + "\n"
-            "│ " + status_emoji + " وضعیت: " + sub["status"] + "\n"
-            "│ 📦 پلن: " + p.get('name', sub['plan']) + "\n"
-            "│ 📊 تحلیل‌ها: " + str(sub['usage_count']) + "/" + str(max_u) + "\n"
-            "│ 📅 انقضا: " + (sub['expires_at'][:10] if sub['expires_at'] else "—") + "\n"
-            "└─────────────────────┘\n\n"
-            "عملیات:\n"
-            "`/act " + str(target) + " day` — فعال‌سازی ۱ روزه\n"
-            "`/act " + str(target) + " month_basic` — فعال‌سازی ماهانه پایه\n"
-            "`/act " + str(target) + " month_unlimited` — فعال‌سازی ماهانه نامحدود\n"
-            "`/act " + str(target) + " year_basic` — فعال‌سازی سالانه پایه\n"
-            "`/act " + str(target) + " year_unlimited` — فعال‌سازی سالانه نامحدود\n"
-            "`/revoke " + str(target) + "` — لغو اشتراک\n"
-            "`/extend " + str(target) + " 7` — افزودن ۷ روز",
-            parse_mode="Markdown"
+            "🆔 آیدی: `" + str(target) + "`\n"
+            "👤 یوزرنیم: @" + (sub["username"] or "—") + "\n"
+            + se + " وضعیت: " + sub["status"] + "\n"
+            "📦 پلن: " + p.get('name', sub['plan']) + "\n"
+            "📊 تحلیل‌ها: " + str(sub['usage_count']) + "/" + str(mx) + "\n"
+            "📅 انقضا: " + (sub['expires_at'][:10] if sub['expires_at'] else "—") + disc_text,
+            parse_mode="Markdown",
+            reply_markup=admin_user_kb(target)
         )
         return
 
-    # ─── ADMIN: REVOKE ───
-    if is_admin(uid) and text.startswith("/revoke ") and len(context.args) == 1:
+    # ─── ADMIN: DISCOUNT ───
+    if is_admin(uid) and text.startswith("/disc ") and len(context.args) == 2:
         try:
             target = int(context.args[0])
+            percent = int(context.args[1])
         except:
-            return await update.message.reply_text("آیدی نامعتبر.")
-        revoke_sub(target)
+            return await update.message.reply_text("فرمت: `/disc USER_ID PERCENT`", parse_mode="Markdown")
+        if percent < 0 or percent > 100:
+            return await update.message.reply_text("درصد باید ۰-۱۰۰ باشد.")
+        set_discount(target, percent)
         try:
-            await context.bot.send_message(target,
-                "╔══════════════════════╗\n"
-                "  ❌ **اشتراک لغو شد**\n"
-                "╚══════════════════════╝\n\n"
-                "اشتراک شما توسط ادمین لغو شد.",
-                parse_mode="Markdown"
-            )
+            if percent > 0:
+                await context.bot.send_message(target,
+                    "🎁 **تخفیف " + str(percent) + "٪ فعال شد!**\n\n"
+                    "قیمت‌های پلن‌ها با تخفیف اعمال شده.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await context.bot.send_message(target, "🚫 **تخفیف شما حذف شد.**", parse_mode="Markdown")
         except: pass
-        await update.message.reply_text("✅ اشتراک " + str(target) + " لغو شد.")
-        return
-
-    # ─── ADMIN: EXTEND ───
-    if is_admin(uid) and text.startswith("/extend ") and len(context.args) == 2:
-        try:
-            target = int(context.args[0])
-            days = int(context.args[1])
-        except:
-            return await update.message.reply_text("فرمت: `/extend USER_ID DAYS`", parse_mode="Markdown")
-        extend_sub(target, days)
-        try:
-            await context.bot.send_message(target,
-                "╔══════════════════════╗\n"
-                "  🔄 **اشتراک تمدید شد**\n"
-                "╚══════════════════════╝\n\n"
-                "اشتراک شما " + str(days) + " روز تمدید شد.",
-                parse_mode="Markdown"
-            )
-        except: pass
-        await update.message.reply_text("✅ اشتراک " + str(target) + " به مدت " + str(days) + " روز تمدید شد.")
+        await update.message.reply_text("✅ تخفیف " + str(percent) + "٪ برای " + str(target) + " تنظیم شد.")
         return
 
     # ─── ADMIN: BROADCAST ───
-    if is_admin(uid) and text.startswith("/broadcast ") and len(context.args) >= 1:
+    if is_admin(uid) and text.startswith("/bc ") and len(context.args) >= 1:
         msg_text = " ".join(context.args)
         user_ids = get_all_user_ids()
         sent = 0
@@ -869,47 +871,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for user_id in user_ids:
             try:
                 await context.bot.send_message(user_id,
-                    "📢 **پیام ادمین**\n\n" + msg_text,
+                    "📢 **" + BOT_NAME + "**\n\n" + msg_text,
                     parse_mode="Markdown"
                 )
                 sent += 1
             except:
                 failed += 1
-        await update.message.reply_text(
-            "✅ ارسال شد: " + str(sent) + "\n❌ ناموفق: " + str(failed)
-        )
+        await update.message.reply_text("✅ ارسال شد: " + str(sent) + "\n❌ ناموفق: " + str(failed))
         return
 
     # ─── CHECK FOR TX HASH ───
     if len(text) >= 10 and not text.startswith("/"):
-        # Check if user has selected a plan first
         conn = sqlite3.connect(str(DB_PATH))
         existing = conn.execute("SELECT id, plan FROM pending_payments WHERE user_id=? AND status='pending'", (uid,)).fetchone()
-        if existing and existing[1] != "unknown" and existing[1] != "awaiting_payment":
+        if existing and existing[1] not in ("unknown", "awaiting_payment", ""):
             conn.execute("UPDATE pending_payments SET tx_hash=?, created_at=datetime('now') WHERE id=?", (text, existing[0]))
             conn.commit(); conn.close()
-        elif existing and existing[1] in ("unknown", "awaiting_payment"):
-            conn.close()
-            return await update.message.reply_text(
-                "❌ لطفاً ابتدا یک پلن انتخاب کنید.\n"
-                "سپس TX Hash را ارسال کنید.",
-                reply_markup=InlineKeyboardMarkup([[btn_main("📦 مشاهده پلن‌ها", "show_plans")]])
-            )
         else:
             conn.close()
             return await update.message.reply_text(
-                "❌ لطفاً ابتدا یک پلن انتخاب کنید.\n"
-                "سپس TX Hash را ارسال کنید.",
-                reply_markup=InlineKeyboardMarkup([[btn_main("📦 مشاهده پلن‌ها", "show_plans")]])
+                "❌ ابتدا یک پلن انتخاب کنید.",
+                reply_markup=InlineKeyboardMarkup([[btn_main("📦 پلن‌ها", "show_plans")]])
             )
 
-        # Get plan for admin notification
         conn2 = sqlite3.connect(str(DB_PATH))
         row = conn2.execute("SELECT plan FROM pending_payments WHERE id=?", (existing[0],)).fetchone()
-        plan_name = PLANS.get(row[0], {}).get('name', row[0]) if row else "نامشخص"
+        pn = PLANS.get(row[0], {}).get('name', row[0]) if row else "نامشخص"
         conn2.close()
 
-        # Notify admin
         if ADMIN_ID:
             try:
                 name = update.effective_user.first_name or "کاربر"
@@ -919,31 +908,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      InlineKeyboardButton("❌ رد", callback_data="reject_" + str(uid))]
                 ])
                 await context.bot.send_message(ADMIN_ID,
-                    "💰 **رسید پرداخت جدید**\n\n"
-                    "┌─────────────────────┐\n"
-                    "│ 👤 " + name + " (@" + uname + ")\n"
-                    "│ 🆔 `" + str(uid) + "`\n"
-                    "│ 📦 پلن: " + plan_name + "\n"
-                    "│ 📝 TX: `" + text[:30] + "...`\n"
-                    "└─────────────────────┘\n\n"
-                    "تایید یا رد کن:",
+                    "💰 **رسید جدید**\n\n👤 " + name + " (@" + uname + ")\n🆔 `" + str(uid) + "`\n📦 " + pn + "\n📝 `" + text[:30] + "...`\n\nتایید یا رد کن:",
                     parse_mode="Markdown", reply_markup=kb
                 )
-                log.info("Receipt sent to admin from user %d, plan: %s", uid, plan_name)
-            except Exception as e:
-                log.error("Failed to send to admin: %s", str(e))
+            except: pass
 
         await update.message.reply_text(
-            "╔══════════════════════╗\n"
-            "  ✅ **رسید ثبت شد**\n"
-            "╚══════════════════════╝\n\n"
-            "رسید شما دریافت شد.\n"
-            "ادمین در حال بررسی است.\n"
-            "بعد از تایید، اشتراک فعال می‌شود.\n\n"
-            "⏳ لطفاً صبر کنید...",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("main_menu")]
-            ])
+            "✅ **رسید ثبت شد.**\nادمین در حال بررسی...",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("main_menu")]])
         )
         return
 
@@ -952,8 +924,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @gate
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "⏳ **شهباز در حال تحلیل...**\n\n"
-        "لطفاً صبر کنید ⚔️",
+        "⏳ **" + BOT_NAME + " در حال تحلیل...**\nلطفاً صبر کنید ⚔️",
         parse_mode="Markdown"
     )
     try:
@@ -963,10 +934,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_memory(raw)
         raw = raw.getvalue()
         if len(raw) > MAX_IMAGE_SIZE:
-            return await msg.edit_text(
-                "❌ حجم تصویر زیاد است.\nحداکثر ۸MB.",
-                reply_markup=InlineKeyboardMarkup([[btn_back("main_menu")]])
-            )
+            return await msg.edit_text("❌ حجم تصویر زیاد است. حداکثر ۸MB.")
         compressed = compress_image(raw)
         b64 = base64.b64encode(compressed).decode()
         analysis = await call_ai(b64)
@@ -975,51 +943,41 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in split_msg(analysis):
             await update.message.reply_text(p, parse_mode="Markdown")
         await update.message.reply_text(
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📸 تحلیل بعدی؟ عکس بفرستید 👇",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_back("main_menu")]
-            ])
+            "━━━━━━━━━━━━━━━━━━\n📸 تحلیل بعدی؟ عکس بفرستید 👇",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn_back("main_menu")]])
         )
     except Exception as e:
         err = str(e)
         if "unavailable" in err.lower() or "credits" in err.lower():
-            user_msg = "❌ سرویس AI موقتاً در دسترس نیست.\nلطفاً بعداً دوباره تلاش کنید."
+            user_msg = "❌ سرویس AI موقتاً در دسترس نیست."
         elif "rate" in err.lower() or "429" in err:
-            user_msg = "⏳ تعداد درخواست‌ها زیاد شده.\nچند دقیقه صبر کنید."
+            user_msg = "⏳ درخواست‌ها زیاد شده. چند دقیقه صبر کنید."
         else:
-            user_msg = "❌ خطا در تحلیل:\n`" + err[:200] + "`"
-        await msg.edit_text(
-            user_msg,
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-                [btn_action("💬 پشتیبانی", "support")]
-            ])
-        )
+            user_msg = "❌ خطا: `" + err[:200] + "`"
+        await msg.edit_text(user_msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[btn_action("💬 پشتیبانی", "support")]]))
 
-# ═══════════════════════ ADMIN COMMANDS ═══════════════════════
+# ═══════════════════════ MAIN ═══════════════════════
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("⛔ دسترسی غیرمجاز.")
     conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute("SELECT id, user_id, username, plan, tx_hash, created_at FROM pending_payments WHERE status='pending' ORDER BY created_at DESC").fetchall()
+    rows = conn.execute("SELECT user_id, username, plan, tx_hash, created_at FROM pending_payments WHERE status='pending' ORDER BY created_at DESC").fetchall()
     conn.close()
     if not rows:
         return await update.message.reply_text("📭 رسید در انتظار نیست.")
     msg = "💰 **رسیدهای در انتظار**\n\n"
     for r in rows:
-        msg += "🆔 `" + str(r[1]) + "` — @" + (r[2] or "—") + " — `" + r[4][:15] + "...` — " + r[5][:16] + "\n"
+        pn = PLANS.get(r[2], {}).get('name', r[2])
+        msg += "🆔 `" + str(r[0]) + "` — @" + (r[1] or "—") + " — " + pn + " — `" + r[3][:15] + "...`\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def activate_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("⛔ دسترسی غیرمجاز.")
     if len(context.args) < 2:
-        return await update.message.reply_text(
-            "فرمت: `/act USER_ID PLAN`\n\n"
-            "Plans: day, month_basic, month_unlimited, year_basic, year_unlimited",
-            parse_mode="Markdown"
-        )
+        return await update.message.reply_text("فرمت: `/act USER_ID PLAN`", parse_mode="Markdown")
     try:
         target_uid = int(context.args[0])
         plan = context.args[1]
@@ -1030,25 +988,12 @@ async def activate_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     activate_sub(target_uid, "", plan)
     p = PLANS[plan]
     try:
-        cd_text = "بدون محدودیت" if p['cooldown'] == 0 else "هر " + str(p['cooldown']) + " دقیقه"
-        max_text = "∞" if p['max'] <= 0 else str(p['max'])
         await context.bot.send_message(target_uid,
-            "╔══════════════════════╗\n"
-            "  ✅ **اشتراک فعال شد!**\n"
-            "╚══════════════════════╝\n\n"
-            "┌─────────────────────┐\n"
-            "│ 📦 پلن: " + p['name'] + "\n"
-            "│ 📊 محدودیت: " + max_text + " تحلیل\n"
-            "│ ⏰ کول‌داون: " + cd_text + "\n"
-            "│ 📅 مدت: " + str(p['days']) + " روز\n"
-            "└─────────────────────┘\n\n"
-            "📸 عکس بفرست برای تحلیل!",
+            "✅ **اشتراک فعال شد!**\n\nپلن: " + p['name'] + "\n\n📸 عکس بفرست!",
             parse_mode="Markdown", reply_markup=main_menu_kb(target_uid)
         )
     except: pass
     await update.message.reply_text("✅ اشتراک " + plan + " برای " + str(target_uid) + " فعال شد.")
-
-# ═══════════════════════ MAIN ═══════════════════════
 
 def main():
     if not TOKEN:   log.error("TOKEN empty"); return
@@ -1059,14 +1004,13 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_start))
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("act", activate_manual))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    log.info("👑 Shahbaz Core VIP Bot running")
+    log.info("⚔ " + BOT_NAME + " running")
     app.run_polling()
 
 if __name__ == "__main__":
