@@ -264,6 +264,9 @@ async def call_ai(image_b64: str, prompt: str = "") -> str:
 
 # ═══════════════════════ GATE ═══════════════════════
 
+def is_admin(uid):
+    return ADMIN_ID != 0 and uid == ADMIN_ID
+
 def gate(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
