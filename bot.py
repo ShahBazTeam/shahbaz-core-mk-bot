@@ -89,6 +89,8 @@ def init_db():
             status TEXT DEFAULT 'pending'
         );
     """)
+    # Clean up old incomplete records
+    conn.execute("DELETE FROM pending_payments WHERE tx_hash IN ('awaiting_payment', '') AND status='pending'")
     conn.commit(); conn.close()
 
 def get_sub(user_id: int):
@@ -473,6 +475,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if plan not in PLANS:
             return await q.edit_message_text("پلن نامعتبر.")
         p = PLANS[plan]
+
+        # Store selected plan in pending_payments immediately
+        conn = sqlite3.connect(str(DB_PATH))
+        username = q.from_user.username or ""
+        existing = conn.execute("SELECT id FROM pending_payments WHERE user_id=? AND status='pending'", (uid,)).fetchone()
+        if existing:
+            conn.execute("UPDATE pending_payments SET plan=? WHERE id=?", (plan, existing[0]))
+        else:
+            conn.execute("INSERT INTO pending_payments (user_id, username, plan, tx_hash) VALUES (?, ?, ?, ?)",
+                         (uid, username, plan, "awaiting_payment"))
+        conn.commit(); conn.close()
+
         kb = InlineKeyboardMarkup([
             [btn_action("📋 کپی آدرس", "copy_addr")],
             [btn_action("📝 ارسال رسید", "how_receipt")],
@@ -490,8 +504,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔹 **آدرس USDT (TRC20):**\n"
             "`" + PAYMENT_ADDRESS + "`\n\n"
             "⚠️ فقط **USDT TRC20** بفرستید.\n\n"
-            "بعد از پرداخت، رسید (TX Hash) را\n"
-            "از طریق دکمه **ارسال رسید** بفرستید.",
+            "بعد از پرداخت، TX Hash را\n"
+            "اینجا بفرستید تا رسید ثبت شود.",
             parse_mode="Markdown", reply_markup=kb
         )
 
@@ -846,15 +860,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ─── CHECK FOR TX HASH ───
     if len(text) >= 10 and not text.startswith("/"):
-        # Store pending payment
+        # Check if user has selected a plan first
         conn = sqlite3.connect(str(DB_PATH))
-        existing = conn.execute("SELECT id FROM pending_payments WHERE user_id=? AND status='pending'", (uid,)).fetchone()
-        if existing:
+        existing = conn.execute("SELECT id, plan FROM pending_payments WHERE user_id=? AND status='pending'", (uid,)).fetchone()
+        if existing and existing[1] != "unknown" and existing[1] != "awaiting_payment":
             conn.execute("UPDATE pending_payments SET tx_hash=?, created_at=datetime('now') WHERE id=?", (text, existing[0]))
+            conn.commit(); conn.close()
+        elif existing and existing[1] in ("unknown", "awaiting_payment"):
+            conn.close()
+            return await update.message.reply_text(
+                "❌ لطفاً ابتدا یک پلن انتخاب کنید.\n"
+                "سپس TX Hash را ارسال کنید.",
+                reply_markup=InlineKeyboardMarkup([[btn_main("📦 مشاهده پلن‌ها", "show_plans")]])
+            )
         else:
-            conn.execute("INSERT INTO pending_payments (user_id, username, plan, tx_hash) VALUES (?, ?, ?, ?)",
-                         (uid, update.effective_user.username or "", "unknown", text))
-        conn.commit(); conn.close()
+            conn.close()
+            return await update.message.reply_text(
+                "❌ لطفاً ابتدا یک پلن انتخاب کنید.\n"
+                "سپس TX Hash را ارسال کنید.",
+                reply_markup=InlineKeyboardMarkup([[btn_main("📦 مشاهده پلن‌ها", "show_plans")]])
+            )
+
+        # Get plan for admin notification
+        conn2 = sqlite3.connect(str(DB_PATH))
+        row = conn2.execute("SELECT plan FROM pending_payments WHERE id=?", (existing[0],)).fetchone()
+        plan_name = PLANS.get(row[0], {}).get('name', row[0]) if row else "نامشخص"
+        conn2.close()
 
         # Notify admin
         if ADMIN_ID:
@@ -870,12 +901,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "┌─────────────────────┐\n"
                     "│ 👤 " + name + " (@" + uname + ")\n"
                     "│ 🆔 `" + str(uid) + "`\n"
+                    "│ 📦 پلن: " + plan_name + "\n"
                     "│ 📝 TX: `" + text[:30] + "...`\n"
                     "└─────────────────────┘\n\n"
                     "تایید یا رد کن:",
                     parse_mode="Markdown", reply_markup=kb
                 )
-                log.info("Receipt sent to admin from user %d", uid)
+                log.info("Receipt sent to admin from user %d, plan: %s", uid, plan_name)
             except Exception as e:
                 log.error("Failed to send to admin: %s", str(e))
 
