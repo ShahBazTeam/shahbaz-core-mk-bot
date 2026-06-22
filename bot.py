@@ -11,8 +11,8 @@ load_dotenv()
 
 TOKEN = os.getenv("TOKEN", "")
 API_KEY = os.getenv("API_KEY", "")
-API_URL = os.getenv("API_URL", "https://api.freemodel.dev/v1/chat/completions")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.5")
+API_URL = os.getenv("API_URL", "https://api.unli.dev/v1/chat/completions")
+MODEL_NAME = os.getenv("MODEL_NAME", "auto")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "TXYZxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 
