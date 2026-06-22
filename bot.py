@@ -493,7 +493,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"┌─────────────────────┐\n"
                 f"│ 📦 پلن: {p['name']}\n"
                 f"│ 📊 محدودیت: {'∞' if p['max'] <= 0 else p['max']} تحلیل\n"
-                f"│ ⏰ کول‌داون: {'بدون محدودیت' if p['cooldown'] == 0 else f'هر {p[\"cooldown\"]} دقیقه'}\n"
+                f"│ ⏰ کول‌داون: {'بدون محدودیت' if p['cooldown'] == 0 else f'هر ' + str(p['cooldown']) + ' دقیقه'}\n"
                 f"│ 📅 مدت: {p['days']} روز\n"
                 f"└─────────────────────┘\n\n"
                 "📸 عکس بفرست برای تحلیل!",
@@ -663,7 +663,7 @@ async def activate_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"┌─────────────────────┐\n"
             f"│ 📦 پلن: {p['name']}\n"
             f"│ 📊 محدودیت: {'∞' if p['max'] <= 0 else p['max']} تحلیل\n"
-            f"│ ⏰ کول‌داون: {'بدون محدودیت' if p['cooldown'] == 0 else f'هر {p[\"cooldown\"]} دقیقه'}\n"
+            f"│ ⏰ کول‌داون: {'بدون محدودیت' if p['cooldown'] == 0 else f'هر ' + str(p['cooldown']) + ' دقیقه'}\n"
             f"│ 📅 مدت: {p['days']} روز\n"
             f"└─────────────────────┘\n\n"
             "📸 عکس بفرست برای تحلیل!",
