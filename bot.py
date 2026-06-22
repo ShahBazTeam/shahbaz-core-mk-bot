@@ -1,4 +1,5 @@
 import os, io, base64, logging, sqlite3, string, random
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -13,64 +14,105 @@ API_KEY = os.getenv("API_KEY", "")
 API_URL = os.getenv("API_URL", "https://api.freemodel.dev/v1/chat/completions")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.5")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "TXYZxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 DB_PATH = Path("data.db")
 
+PLANS = {
+    "day": {"name": "۱ روزه", "price": 5, "days": 1, "max": -1, "cooldown": 30,
+            "desc": "تستی — هر ۳۰ دقیقه یک تحلیل"},
+    "month_basic": {"name": "۱ ماهه پایه", "price": 30, "days": 30, "max": 500, "cooldown": 15,
+                    "desc": "۵۰۰ تحلیل — هر ۱۵ دقیقه"},
+    "month_unlimited": {"name": "۱ ماهه نامحدود", "price": 60, "days": 30, "max": -1, "cooldown": 0,
+                        "desc": "نامحدود — بدون محدودیت"},
+}
+
 # ═══════════════════════ DATABASE ═══════════════════════
 
 def init_db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            key TEXT PRIMARY KEY, created_by INTEGER, note TEXT DEFAULT '',
-            created_at TEXT DEFAULT (datetime('now')), expires_at TEXT, is_active INTEGER DEFAULT 1
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            plan TEXT NOT NULL DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            tx_hash TEXT DEFAULT '',
+            activated_at TEXT,
+            expires_at TEXT,
+            usage_count INTEGER DEFAULT 0,
+            max_usage INTEGER DEFAULT 0,
+            cooldown_minutes INTEGER DEFAULT 0,
+            last_analysis_at TEXT DEFAULT ''
         );
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', license_key TEXT,
-            activated_at TEXT DEFAULT (datetime('now')), usage_count INTEGER DEFAULT 0, is_premium INTEGER DEFAULT 0
+        CREATE TABLE IF NOT EXISTS pending_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT DEFAULT '',
+            plan TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            status TEXT DEFAULT 'pending'
         );
     """)
     conn.commit(); conn.close()
 
-def is_licensed(user_id: int) -> bool:
+def get_sub(user_id: int):
     conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
-    c.execute("SELECT is_premium FROM users WHERE user_id = ?", (user_id,))
-    r = c.fetchone()
+    conn.row_factory = sqlite3.Row
+    r = conn.execute("SELECT * FROM subscriptions WHERE user_id = ?", (user_id,)).fetchone()
     conn.close()
-    return r is not None and r[0] == 1
+    return dict(r) if r else None
 
-def get_user_stats(user_id: int):
+def is_active(user_id: int) -> bool:
+    sub = get_sub(user_id)
+    if not sub or sub["status"] != "active": return False
+    if sub["expires_at"] and datetime.fromisoformat(sub["expires_at"]) < datetime.now():
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("UPDATE subscriptions SET status='expired' WHERE user_id=?", (user_id,))
+        conn.commit(); conn.close()
+        return False
+    return True
+
+def can_analyze(user_id: int) -> tuple:
+    sub = get_sub(user_id)
+    if not sub or sub["status"] != "active":
+        return False, "اشتراک فعال ندارید"
+    if sub["expires_at"] and datetime.fromisoformat(sub["expires_at"]) < datetime.now():
+        return False, "اشتراک شما منقضی شده"
+    if sub["max_usage"] > 0 and sub["usage_count"] >= sub["max_usage"]:
+        return False, f"سقف تحلیل ({sub['max_usage']}) تمام شده"
+    if sub["cooldown_minutes"] > 0 and sub["last_analysis_at"]:
+        last = datetime.fromisoformat(sub["last_analysis_at"])
+        diff = (datetime.now() - last).total_seconds() / 60
+        if diff < sub["cooldown_minutes"]:
+            remaining = int(sub["cooldown_minutes"] - diff)
+            return False, f"صبر کن {remaining} دقیقه"
+    return True, "ok"
+
+def record_analysis(user_id: int):
     conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
-    c.execute("SELECT license_key, usage_count FROM users WHERE user_id = ?", (user_id,))
-    r = c.fetchone()
-    conn.close()
-    return r if r else (None, 0)
+    conn.execute("UPDATE subscriptions SET usage_count=usage_count+1, last_analysis_at=? WHERE user_id=?",
+                 (datetime.now().isoformat(), user_id))
+    conn.commit(); conn.close()
 
-# ═══════════════════════ LICENSE GATE ═══════════════════════
-
-def gate(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not is_licensed(update.effective_user.id):
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔑 فعال‌سازی لایسنس", callback_data="show_activate")]])
-            await update.message.reply_text(
-                "╔══════════════════════╗\n"
-                "     🔐 **شهباز کور**\n"
-                "     دسترسی محدود\n"
-                "╚══════════════════════╝\n\n"
-                "شما لایسنس فعال ندارید.\n"
-                "برای استفاده، یک کد لایسنس وارد کنید:\n\n"
-                "`/activate XXXX-XXXX-XXXX`\n\n"
-                "📩 دریافت لایسنس: @admin",
-                parse_mode="Markdown", reply_markup=kb
-            )
-            return
-        return await func(update, context)
-    return wrapper
+def activate_sub(user_id: int, username: str, plan: str):
+    p = PLANS[plan]
+    expires = (datetime.now() + timedelta(days=p["days"])).isoformat()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        INSERT INTO subscriptions (user_id, username, plan, status, activated_at, expires_at,
+            usage_count, max_usage, cooldown_minutes, last_analysis_at)
+        VALUES (?, ?, ?, 'active', ?, ?, 0, ?, ?, '')
+        ON CONFLICT(user_id) DO UPDATE SET
+            plan=excluded.plan, status='active', activated_at=excluded.activated_at,
+            expires_at=excluded.expires_at, usage_count=0, max_usage=excluded.max_usage,
+            cooldown_minutes=excluded.cooldown_minutes, last_analysis_at=''
+    """, (user_id, username, plan, datetime.now().isoformat(), expires, p["max"], p["cooldown"]))
+    conn.commit(); conn.close()
 
 # ═══════════════════════ SYSTEM PROMPT ═══════════════════════
 
@@ -145,203 +187,334 @@ async def call_ai(image_b64: str, prompt: str = "") -> str:
             raise Exception(f"API error {r.status_code}")
         return r.json()["choices"][0]["message"]["content"]
 
+# ═══════════════════════ GATE ═══════════════════════
+
+def gate(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        ok, reason = can_analyze(uid)
+        if not ok:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 مشاهده پلن‌ها", callback_data="show_plans")]])
+            await update.message.reply_text(
+                f"╔══════════════════════╗\n"
+                f"  🔐 **شهباز کور**\n"
+                f"  {reason}\n"
+                f"╚══════════════════════╝\n\n"
+                "برای خرید اشتراک:\n`/plans`",
+                parse_mode="Markdown", reply_markup=kb
+            )
+            return
+        return await func(update, context)
+    return wrapper
+
 # ═══════════════════════ COMMANDS ═══════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     name = update.effective_user.first_name or "کاربر"
+    sub = get_sub(uid)
 
-    if is_licensed(uid):
-        key, usage = get_user_stats(uid)
+    if sub and sub["status"] == "active":
+        p = PLANS.get(sub["plan"], {})
+        expires = sub["expires_at"][:10] if sub["expires_at"] else "—"
+        usage = sub["usage_count"]
+        max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📸 ارسال عکس برای تحلیل", callback_data="send_photo_hint")],
-            [InlineKeyboardButton("📊 آمار من", callback_data="my_stats")]
+            [InlineKeyboardButton("📸 ارسال عکس", callback_data="send_photo_hint")],
+            [InlineKeyboardButton("📊 آمار من", callback_data="my_stats")],
+            [InlineKeyboardButton("🔄 تمدید اشتراک", callback_data="show_plans")]
         ])
         await update.message.reply_text(
             f"⚔ **شهباز کور** ⚔\n"
             f"═━━━━━━━━━━━━━━━╕\n"
             f"👤 **{name}**\n"
-            f"🔑 لایسنس: `{key}`\n"
-            f"📊 تحلیلها: **{usage}**\n\n"
+            f"📦 پلن: {p.get('name', sub['plan'])}\n"
+            f"📊 تحلیلها: {usage}/{max_u}\n"
+            f"📅 انقضا: {expires}\n\n"
             f"📸 عکس بفرست تا تحلیل کنم\n"
             f"یا `/analyze Smoke vs Sub-Zero`",
             parse_mode="Markdown", reply_markup=kb
         )
     else:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔑 فعال‌سازی لایسنس", callback_data="show_activate")],
-            [InlineKeyboardButton("📩 دریافت لایسنس", url="https://t.me/admin")]
+            [InlineKeyboardButton("📦 مشاهده پلن‌ها", callback_data="show_plans")],
+            [InlineKeyboardButton("📩 پشتیبانی", url="https://t.me/admin")]
         ])
         await update.message.reply_text(
             "⚔ **شهباز کور** ⚔\n"
             "ترمینال تحلیلی شرط‌بندی MK\n"
             "مخصوص سیستم مارتینگل\n\n"
-            "🔐 **نیاز به لایسنس**\n\n"
-            "کد لایسنس خود را وارد کنید:\n"
-            "`/activate XXXX-XXXX-XXXX`",
+            "🔐 **نیاز به اشتراک**\n\n"
+            "برای مشاهده پلن‌ها و خرید:\n`/plans`",
             parse_mode="Markdown", reply_markup=kb
         )
 
-async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    uname = update.effective_user.username or ""
-    key = " ".join(context.args).strip().upper()
-
-    if not key:
-        await update.message.reply_text("فرمت: `/activate XXXX-XXXX-XXXX`", parse_mode="Markdown")
-        return
-
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
-    c.execute("SELECT is_active FROM licenses WHERE key = ?", (key,))
-    row = c.fetchone()
-
-    if not row:
-        conn.close()
-        return await update.message.reply_text("❌ کد نامعتبر.")
-    if row[0] == 0:
-        conn.close()
-        return await update.message.reply_text("❌ این کد قبلاً استفاده شده.")
-
-    c.execute("UPDATE licenses SET is_active = 0 WHERE key = ?", (key,))
-    c.execute("""INSERT INTO users (user_id, username, license_key, usage_count, is_premium)
-        VALUES (?, ?, ?, 0, 1) ON CONFLICT(user_id) DO UPDATE
-        SET license_key=excluded.license_key, is_premium=1, username=excluded.username""", (uid, uname, key))
-    conn.commit(); conn.close()
-
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📸 ارسال عکس", callback_data="send_photo_hint")]])
+async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎁 ۱ روزه — $5", callback_data="plan_day")],
+        [InlineKeyboardButton(f"📦 ۱ ماهه پایه — $30", callback_data="plan_month_basic")],
+        [InlineKeyboardButton(f"👑 ۱ ماهه نامحدود — $60", callback_data="plan_month_unlimited")]
+    ])
     await update.message.reply_text(
         "╔══════════════════════╗\n"
-        "  ✅ **لایسنس فعال شد**\n"
+        "     📦 **پلن‌های اشتراک**\n"
         "╚══════════════════════╝\n\n"
-        f"🔑 `{key}`\n\n"
-        "حالا می‌تونی عکس بفرستی.\n"
-        "**به شهباز خوش اومدی** 🎯",
+        "🎁 **۱ روزه — $5**\n"
+        "   هر ۳۰ دقیقه یک تحلیل\n\n"
+        "📦 **۱ ماهه پایه — $30**\n"
+        "   ۵۰۰ تحلیل — هر ۱۵ دقیقه\n\n"
+        "👑 **۱ ماهه نامحدود — $60**\n"
+        "   بدون محدودیت\n\n"
+        "💰 پرداخت: **USDT (TRC20)**\n\n"
+        "پلن مورد نظر را انتخاب کنید:",
         parse_mode="Markdown", reply_markup=kb
     )
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_licensed(uid):
-        return await update.message.reply_text("لایسنس فعال نیست. از `/activate` استفاده کن.", parse_mode="Markdown")
-    key, usage = get_user_stats(uid)
+    sub = get_sub(uid)
+    if not sub or sub["status"] != "active":
+        return await update.message.reply_text("اشتراک فعال ندارید. `/plans`", parse_mode="Markdown")
+    p = PLANS.get(sub["plan"], {})
     name = update.effective_user.first_name or "کاربر"
+    max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
     await update.message.reply_text(
         f"👤 **{name}**\n"
-        f"🔑 `{key}`\n"
-        f"📊 تحلیل‌های انجام شده: **{usage}**\n"
-        f"💎 وضعیت: **VIP**",
+        f"📦 پلن: {p.get('name', sub['plan'])}\n"
+        f"📊 تحلیلها: **{sub['usage_count']}/{max_u}**\n"
+        f"📅 انقضا: **{sub['expires_at'][:10]}**\n"
+        f"💎 وضعیت: **فعال**",
         parse_mode="Markdown"
     )
 
-# ─── ADMIN ───
+# ─── RECEIPT ───
+
+async def receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    args = context.args
+    if not args:
+        return await update.message.reply_text(
+            "فرمت: `/receipt USDT-TRC20-TXHASH`\n\n"
+            "آدرس USDT TRC20 پرداخت شده + TX Hash را بفرست.",
+            parse_mode="Markdown"
+        )
+
+    tx = " ".join(args).strip()
+    if len(tx) < 10:
+        return await update.message.reply_text("❌ TX Hash نامعتبر است.")
+
+    # Find pending plan selection or ask user
+    # Store pending payment
+    conn = sqlite3.connect(str(DB_PATH))
+    # Check if user already has pending
+    existing = conn.execute("SELECT id FROM pending_payments WHERE user_id=? AND status='pending'", (uid,)).fetchone()
+    if existing:
+        conn.execute("UPDATE pending_payments SET tx_hash=?, created_at=datetime('now') WHERE id=?", (tx, existing[0]))
+    else:
+        conn.execute("INSERT INTO pending_payments (user_id, username, plan, tx_hash) VALUES (?, ?, ?, ?)",
+                     (uid, update.effective_user.username or "", "unknown", tx))
+    conn.commit(); conn.close()
+
+    # Notify admin
+    if ADMIN_ID:
+        try:
+            name = update.effective_user.first_name or "کاربر"
+            uname = update.effective_user.username or "—"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تایید", callback_data=f"approve_{uid}"),
+                 InlineKeyboardButton("❌ رد", callback_data=f"reject_{uid}")]
+            ])
+            await context.bot.send_message(ADMIN_ID,
+                f"💰 **رسید پرداخت**\n\n"
+                f"👤 {name} (@{uname})\n"
+                f"🆔 `{uid}`\n"
+                f"📝 TX: `{tx[:20]}...`\n\n"
+                "تایید یا رد کن:",
+                parse_mode="Markdown", reply_markup=kb
+            )
+        except: pass
+
+    await update.message.reply_text(
+        "✅ **رسید شما ثبت شد**\n\n"
+        "ادمین در حال بررسی است.\n"
+        "بعد از تایید، اشتراک شما فعال می‌شود.",
+        parse_mode="Markdown"
+    )
+
+# ─── ADMIN COMMANDS ───
 
 def is_admin(uid): return uid == ADMIN_ID
 
-async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("⛔ دسترسی غیرمجاز.")
-    note = " ".join(context.args) if context.args else ""
-    key = generate_key()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("INSERT INTO licenses (key, created_by, note) VALUES (?, ?, ?)", (key, ADMIN_ID, note))
-    conn.commit(); conn.close()
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 کپی", callback_data=f"copy_{key}")]
-    ])
-    await update.message.reply_text(
-        f"🔑 **لایسنس جدید**\n\n`{key}`\n\n📝 {note or '—'}\n\n"
-        "کد رو برای کاربر بفرست.",
-        parse_mode="Markdown", reply_markup=kb
-    )
-
-async def listkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("⛔ دسترسی غیرمجاز.")
     conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute("SELECT key, note, is_active, created_at FROM licenses ORDER BY created_at DESC LIMIT 20").fetchall()
+    rows = conn.execute("SELECT id, user_id, username, plan, tx_hash, created_at FROM pending_payments WHERE status='pending' ORDER BY created_at DESC").fetchall()
     conn.close()
     if not rows:
-        return await update.message.reply_text("📭 هیچ لایسنس یافت نشد.")
-    msg = "📋 **لایسنس‌ها**\n\n"
-    for k, n, a, t in rows:
-        s = "✅" if a else "❌"
-        msg += f"{s} `{k}` — {n or '—'} ({t[:10]})\n"
+        return await update.message.reply_text("📭 رسید در انتظار نیست.")
+    msg = "💰 **رسیدهای در انتظار**\n\n"
+    for r in rows:
+        msg += f"🆔 `{r[1]}` — @{r[2] or '—'} — `{r[4][:15]}...` — {r[5][:16]}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def activate_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("⛔ دسترسی غیرمجاز.")
-    key = " ".join(context.args).strip().upper()
-    if not key:
-        return await update.message.reply_text("فرمت: `/revoke XXXX-XXXX-XXXX`", parse_mode="Markdown")
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("UPDATE licenses SET is_active = 0 WHERE key = ?", (key,))
-    conn.execute("UPDATE users SET is_premium = 0 WHERE license_key = ?", (key,))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"❌ `{key}` غیرفعال شد.", parse_mode="Markdown")
+    if len(context.args) < 2:
+        return await update.message.reply_text("فرمت: `/act USER_ID PLAN`\n Plans: day, month_basic, month_unlimited", parse_mode="Markdown")
+    try:
+        target_uid = int(context.args[0])
+        plan = context.args[1]
+    except: return await update.message.reply_text("فرمت: `/act USER_ID PLAN`", parse_mode="Markdown")
+    if plan not in PLANS:
+        return await update.message.reply_text(f"پلن نامعتبر. یکی از: {', '.join(PLANS.keys())}")
+    activate_sub(target_uid, "", plan)
+    p = PLANS[plan]
+    try:
+        await context.bot.send_message(target_uid,
+            f"✅ **اشتراک شما فعال شد!**\n\n"
+            f"📦 پلن: {p['name']}\n"
+            f"📊 محدودیت: {p['max'] if p['max'] > 0 else '∞'} تحلیل\n"
+            f"⏰ کول‌دawn: هر {p['cooldown']} دقیقه\n"
+            f"📅 مدت: {p['days']} روز\n\n"
+            "📸 عکس بفرست برای تحلیل!",
+            parse_mode="Markdown"
+        )
+    except: pass
+    await update.message.reply_text(f"✅ اشتراک {plan} برای {target_uid} فعال شد.")
 
-# ─── CALLBACKS ───
+# ═══════════════════════ CALLBACKS ═══════════════════════
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "show_activate":
-        await query.edit_message_text(
-            "🔑 **فعال‌سازی لایسنس**\n\n"
-            "کد ۱۲ رقمی خود را بفرست:\n`/activate XXXX-XXXX-XXXX`\n\n"
-            "❓ کد نداری؟ با ادمین تماس بگیر.",
-            parse_mode="Markdown"
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+
+    if d == "show_plans":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎁 ۱ روزه — $5", callback_data="plan_day")],
+            [InlineKeyboardButton("📦 ۱ ماهه پایه — $30", callback_data="plan_month_basic")],
+            [InlineKeyboardButton("👑 ۱ ماهه نامحدود — $60", callback_data="plan_month_unlimited")]
+        ])
+        await q.edit_message_text(
+            "╔══════════════════════╗\n"
+            "     📦 **پلن‌های اشتراک**\n"
+            "╚══════════════════════╝\n\n"
+            "🎁 **۱ روزه — $5**\n   هر ۳۰ دقیقه یک تحلیل\n\n"
+            "📦 **۱ ماهه پایه — $30**\n   ۵۰۰ تحلیل — هر ۱۵ دقیقه\n\n"
+            "👑 **۱ ماهه نامحدود — $60**\n   بدون محدودیت\n\n"
+            "💰 پرداخت: **USDT (TRC20)**\n\n"
+            "پلن را انتخاب کنید:",
+            parse_mode="Markdown", reply_markup=kb
         )
-    elif data == "my_stats":
-        uid = query.from_user.id
-        if not is_licensed(uid):
-            return await query.edit_message_text("❌ لایسنس فعال نیست.")
-        key, usage = get_user_stats(uid)
-        await query.edit_message_text(
-            f"📊 **آمار شما**\n\n🔑 `{key}`\n📊 تحلیلها: **{usage}**\n💎 **VIP**",
-            parse_mode="Markdown"
-        )
-    elif data == "send_photo_hint":
-        await query.edit_message_text(
-            "📸 فقط عکس اسکرین‌شات رو بفرست.\n"
-            "شهباز خودش تحلیل می‌کنه.\n\n"
-            "یا دستی: `/analyze Smoke vs Sub-Zero`",
+
+    elif d.startswith("plan_"):
+        plan = d.replace("plan_", "")
+        if plan not in PLANS:
+            return await q.edit_message_text("پلن نامعتبر.")
+        p = PLANS[plan]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 کپی آدرس", callback_data=f"copy_addr")]
+        ])
+        await q.edit_message_text(
+            f"╔══════════════════════╗\n"
+            f"  💰 **پرداخت — {p['name']}**\n"
+            f"╚══════════════════════╝\n\n"
+            f"💵 مبلغ: **${p['price']}**\n"
+            f"📦 پلن: **{p['name']}**\n"
+            f"📝 {p['desc']}\n\n"
+            f"🔹 **آدرس USDT (TRC20):**\n"
+            f"`{PAYMENT_ADDRESS}`\n\n"
+            f"⚠️ فقط **USDT TRC20** بفرستید.\n"
+            f"بعد از پرداخت:\n"
+            f"`/receipt TX_HASH`\n\n"
+            f"رسید را به ادمین نیز بفرستید.",
             parse_mode="Markdown"
         )
 
-# ─── ANALYZE TEXT ───
+    elif d == "send_photo_hint":
+        await q.edit_message_text(
+            "📸 فقط عکس اسکرین‌شات رو بفرست.\n"
+            "شهباز خودش تحلیل می‌کنه.\n\n"
+            "یا: `/analyze Smoke vs Sub-Zero`",
+            parse_mode="Markdown"
+        )
+
+    elif d == "my_stats":
+        uid = q.from_user.id
+        sub = get_sub(uid)
+        if not sub or sub["status"] != "active":
+            return await q.edit_message_text("اشتراک فعال نیست.")
+        p = PLANS.get(sub["plan"], {})
+        max_u = sub["max_usage"] if sub["max_usage"] > 0 else "∞"
+        await q.edit_message_text(
+            f"📊 **آمار شما**\n\n"
+            f"📦 پلن: {p.get('name', sub['plan'])}\n"
+            f"📊 تحلیلها: **{sub['usage_count']}/{max_u}**\n"
+            f"📅 انقضا: **{sub['expires_at'][:10]}**",
+            parse_mode="Markdown"
+        )
+
+    elif d.startswith("approve_"):
+        if not is_admin(q.from_user.id):
+            return await q.answer("⛔ غیرمجاز", show_alert=True)
+        target = int(d.split("_")[1])
+        plan = "month_basic"  # default
+        # Try to find what plan the user was trying to buy
+        conn = sqlite3.connect(str(DB_PATH))
+        row = conn.execute("SELECT plan FROM pending_payments WHERE user_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1", (target,)).fetchone()
+        if row and row[0] in PLANS:
+            plan = row[0]
+        conn.execute("UPDATE pending_payments SET status='approved' WHERE user_id=? AND status='pending'", (target,))
+        conn.commit(); conn.close()
+        activate_sub(target, "", plan)
+        p = PLANS[plan]
+        try:
+            await context.bot.send_message(target,
+                f"✅ **اشتراک شما فعال شد!**\n\n"
+                f"📦 پلن: {p['name']}\n"
+                f"📊 محدودیت: {p['max'] if p['max'] > 0 else '∞'} تحلیل\n"
+                f"⏰ کول‌دawn: هر {p['cooldown']} دقیقه\n"
+                f"📅 مدت: {p['days']} روز\n\n"
+                "📸 عکس بفرست برای تحلیل!",
+                parse_mode="Markdown"
+            )
+        except: pass
+        await q.edit_message_text(f"✅ تایید شد — اشتراک {plan} فعال شد.")
+
+    elif d.startswith("reject_"):
+        if not is_admin(q.from_user.id):
+            return await q.answer("⛔ غیرمجاز", show_alert=True)
+        target = int(d.split("_")[1])
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("UPDATE pending_payments SET status='rejected' WHERE user_id=? AND status='pending'", (target,))
+        conn.commit(); conn.close()
+        try:
+            await context.bot.send_message(target, "❌ **رسید شما تایید نشد.**\n\nبا ادمین تماس بگیرید.", parse_mode="Markdown")
+        except: pass
+        await q.edit_message_text("❌ رد شد.")
+
+# ═══════════════════════ ANALYZE ═══════════════════════
 
 @gate
 async def analyze_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     if not text or "vs" not in text.lower():
         return await update.message.reply_text("فرمت: `/analyze Smoke vs Sub-Zero`", parse_mode="Markdown")
-
-    msg = await update.message.reply_text(
-        "⏳ **شهباز در حال تحلیل...**\n━━━━━━━━━",
-        parse_mode="Markdown"
-    )
+    msg = await update.message.reply_text("⏳ **شهباز در حال تحلیل...**", parse_mode="Markdown")
     try:
         result = await call_ai("", f"تحلیل مچ‌آپ: {text}")
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.execute("UPDATE users SET usage_count = usage_count + 1 WHERE user_id = ?", (update.effective_user.id,))
-        conn.commit(); conn.close()
+        record_analysis(update.effective_user.id)
         await msg.delete()
         for p in split_msg(result):
             await update.message.reply_text(p, parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ خطا: {str(e)[:200]}")
 
-# ─── ANALYZE PHOTO ───
-
 @gate
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        "⏳ **شهباز در حال تحلیل تصویر...**\n━━━━━━━━━",
-        parse_mode="Markdown"
-    )
+    msg = await update.message.reply_text("⏳ **شهباز در حال تحلیل تصویر...**", parse_mode="Markdown")
     try:
         photo = update.message.photo[-1]
         file = await photo.get_file()
@@ -350,13 +523,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw = raw.getvalue()
         if len(raw) > MAX_IMAGE_SIZE:
             return await msg.edit_text("❌ حجم تصویر زیاد. حداکثر ۸MB.")
-
         compressed = compress_image(raw)
         b64 = base64.b64encode(compressed).decode()
         analysis = await call_ai(b64)
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.execute("UPDATE users SET usage_count = usage_count + 1 WHERE user_id = ?", (update.effective_user.id,))
-        conn.commit(); conn.close()
+        record_analysis(update.effective_user.id)
         await msg.delete()
         for p in split_msg(analysis):
             await update.message.reply_text(p, parse_mode="Markdown")
@@ -374,12 +544,12 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("activate", activate))
+    app.add_handler(CommandHandler("plans", plans))
     app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("receipt", receipt))
     app.add_handler(CommandHandler("analyze", analyze_text))
-    app.add_handler(CommandHandler("genkey", genkey))
-    app.add_handler(CommandHandler("listkeys", listkeys))
-    app.add_handler(CommandHandler("revoke", revoke))
+    app.add_handler(CommandHandler("pending", pending))
+    app.add_handler(CommandHandler("act", activate_manual))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
