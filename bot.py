@@ -1,6 +1,7 @@
-import os, io, base64, logging, sqlite3, json
+import os, io, base64, logging, sqlite3, json, threading
 from datetime import datetime, timedelta
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 import httpx
 from PIL import Image
@@ -1046,6 +1047,26 @@ async def activate_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: pass
     await update.message.reply_text("✅ فعال شد.")
 
+# ═══════════════════════ HTTP SERVER (keep Render alive) ═══════════════════════
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def start_http_server():
+    port = int(os.getenv("PORT", "8080"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+        log.info("HTTP server on port %d", port)
+        server.serve_forever()
+    except Exception as e:
+        log.warning("HTTP server failed: %s", str(e))
+
 # ═══════════════════════ MAIN ═══════════════════════
 
 def main():
@@ -1054,6 +1075,11 @@ def main():
     if ADMIN_ID == 0: log.warning("ADMIN_ID not set")
 
     init_db()
+
+    # Start HTTP server to keep Render alive
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
